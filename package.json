@@ -1,0 +1,23 @@
+{
+  "name": "@restaurant-saas/print-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local WiFi print bridge — forwards print_jobs from Supabase to ESC/POS printers on the LAN over TCP:9100.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "print-bridge": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "build": "./build.sh",
+    "build:macos-arm64": "./build.sh macos-arm64",
+    "build:macos-x64": "./build.sh macos-x64",
+    "build:win-x64": "./build.sh win-x64",
+    "build:linux-x64": "./build.sh linux-x64"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.100.1"
+  }
+}
