@@ -27,6 +27,11 @@ mkdir -p dist
 
 bun install --no-summary
 
+# Stamped into the binary so the running bridge can report which build it is
+# (see src/version.mjs). Read with bun, not node — node isn't guaranteed here.
+VERSION="$(bun -e 'console.log(JSON.parse(require("fs").readFileSync("package.json","utf8")).version)')"
+echo "==> version $VERSION"
+
 for tgt in "${TARGETS[@]}"; do
   ext=""
   case "$tgt" in
@@ -38,7 +43,9 @@ for tgt in "${TARGETS[@]}"; do
   esac
   outfile="dist/print-bridge-${tgt}${ext}"
   echo "==> building $outfile"
-  bun build --compile --target="$btarget" --outfile="$outfile" ./src/index.mjs
+  bun build --compile --target="$btarget" \
+    --define "__BRIDGE_VERSION__=\"$VERSION\"" \
+    --outfile="$outfile" ./src/index.mjs
   if [[ -z "$ext" ]]; then chmod +x "$outfile"; fi
 done
 

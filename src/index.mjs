@@ -2,18 +2,19 @@
 /**
  * fujun-bridge — local WiFi print bridge.
  *
- * Connects to Supabase, watches `print_jobs` for the configured restaurant,
+ * Connects to Supabase, watches `print_jobs` for the configured restaurants,
  * and forwards any pending job whose target printer has transport='wifi'
  * to that printer over TCP:9100.
  *
- * One process can drive many printers in the same restaurant. To run multiple
- * restaurants, run multiple bridge processes with different configs.
+ * One process can drive many printers across one or more restaurants on the
+ * same PC (e.g. a restaurant and its sucursal): list every restaurant in
+ * `restaurant_ids`. The legacy single `restaurant_id` string still works.
  *
  * Config: ~/.fujun-bridge/config.json (or $PRINT_BRIDGE_CONFIG):
  *   {
  *     "supabase_url":      "https://xxxx.supabase.co",
  *     "service_role_key":  "eyJhbGc...",     // KEEP THIS SECRET
- *     "restaurant_id":     "uuid",
+ *     "restaurant_ids":    ["uuid", ...],    // or legacy "restaurant_id": "uuid"
  *     "label":             "bridge@cocina",  // optional
  *     "poll_interval_ms":  30000,            // optional, fallback poll
  *     "max_attempts":      3                 // optional
@@ -22,7 +23,9 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { loadConfig } from "./config.mjs";
+import { VERSION } from "./version.mjs";
 import { renderKitchenTicket } from "./template.mjs";
+import { renderCajaReport } from "./caja-report.mjs";
 import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import crypto from "node:crypto";
@@ -45,8 +48,8 @@ function log(...args) {
 async function reloadPrinters() {
   const { data, error } = await supabase
     .from("printers")
-    .select("id, name, transport, connection, is_active")
-    .eq("restaurant_id", cfg.restaurantId)
+    .select("id, name, transport, connection, is_active, chars_per_line, print_settings")
+    .in("restaurant_id", cfg.restaurantIds)
     .in("transport", ["wifi", "usb_bridge"])
     .eq("is_active", true);
   if (error) {
@@ -56,6 +59,12 @@ async function reloadPrinters() {
   printers.clear();
   for (const p of data ?? []) {
     const c = p.connection ?? {};
+    // Body width for this printer's paper (80mm ≈ 48, 58mm ≈ 32). Threaded
+    // into renderKitchenTicket so tickets fit the configured paper size.
+    const charsPerLine = Number(p.chars_per_line) || 48;
+    // Per-printer formatting + line toggles (bold, spacing, size, visible
+    // lines). Threaded alongside chars_per_line into the renderer.
+    const printSettings = p.print_settings ?? {};
     if (p.transport === "wifi") {
       if (!c.host) continue;
       printers.set(p.id, {
@@ -63,6 +72,8 @@ async function reloadPrinters() {
         name: p.name,
         host: c.host,
         port: Number(c.port) || 9100,
+        chars_per_line: charsPerLine,
+        print_settings: printSettings,
       });
     } else if (p.transport === "usb_bridge") {
       if (!c.os_printer_name) continue;
@@ -70,6 +81,8 @@ async function reloadPrinters() {
         transport: "usb_bridge",
         name: p.name,
         os_printer_name: c.os_printer_name,
+        chars_per_line: charsPerLine,
+        print_settings: printSettings,
       });
     }
   }
@@ -86,7 +99,11 @@ async function claimPrinters() {
   if (ids.length === 0) return;
   await supabase
     .from("printers")
-    .update({ claimed_by_device_id: DEVICE_ID, claimed_at: new Date().toISOString() })
+    .update({
+      claimed_by_device_id: DEVICE_ID,
+      claimed_at: new Date().toISOString(),
+      bridge_version: VERSION,
+    })
     .in("id", ids)
     .or(`claimed_by_device_id.is.null,claimed_by_device_id.eq.${DEVICE_ID}`);
 }
@@ -94,9 +111,12 @@ async function claimPrinters() {
 async function heartbeat() {
   const ids = Array.from(printers.keys());
   if (ids.length === 0) return;
+  // bridge_version rides along on every heartbeat, not just the claim: an
+  // upgraded binary restarting onto printers it already owns wouldn't
+  // otherwise refresh the number until something re-claimed them.
   await supabase
     .from("printers")
-    .update({ last_seen_at: new Date().toISOString() })
+    .update({ last_seen_at: new Date().toISOString(), bridge_version: VERSION })
     .in("id", ids);
 }
 
@@ -121,7 +141,9 @@ async function processJob(job) {
     }
 
     log(`printing job ${job.id} → ${printer.name} (${printer.transport})`);
-    const bytes = renderKitchenTicket(job.payload);
+    const bytes = job.kind === "caja_report"
+      ? renderCajaReport(job.payload, printer.chars_per_line, printer.print_settings)
+      : renderKitchenTicket(job.payload, printer.chars_per_line, printer.print_settings);
     if (printer.transport === "wifi") {
       await sendOverTcp(printer.host, printer.port, bytes);
     } else if (printer.transport === "usb_bridge") {
@@ -164,7 +186,7 @@ async function drainPending() {
   const { data, error } = await supabase
     .from("print_jobs")
     .select("*")
-    .eq("restaurant_id", cfg.restaurantId)
+    .in("restaurant_id", cfg.restaurantIds)
     .in("printer_id", ids)
     .eq("status", "pending")
     .order("created_at", { ascending: true })
@@ -177,34 +199,39 @@ async function drainPending() {
 }
 
 async function main() {
-  log(`fujun-bridge starting (label=${cfg.label}, restaurant=${cfg.restaurantId})`);
+  log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, restaurants=${cfg.restaurantIds.join(", ")})`);
   await reloadPrinters();
   await claimPrinters();
   await drainPending();
 
-  const channel = supabase
-    .channel(`bridge-${cfg.restaurantId}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "INSERT",
-        schema: "public",
-        table: "print_jobs",
-        filter: `restaurant_id=eq.${cfg.restaurantId}`,
-      },
-      (payload) => { void processJob(payload.new); },
-    )
-    .on(
-      "postgres_changes",
-      {
-        event: "*",
-        schema: "public",
-        table: "printers",
-        filter: `restaurant_id=eq.${cfg.restaurantId}`,
-      },
-      async () => { await reloadPrinters(); await claimPrinters(); },
-    )
-    .subscribe((status) => log("realtime:", status));
+  // One channel per restaurant: postgres_changes filters only support a
+  // single eq per subscription, and separate channels keep each sucursal's
+  // stream independent.
+  const channels = cfg.restaurantIds.map((rid) =>
+    supabase
+      .channel(`bridge-${rid}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "print_jobs",
+          filter: `restaurant_id=eq.${rid}`,
+        },
+        (payload) => { void processJob(payload.new); },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "printers",
+          filter: `restaurant_id=eq.${rid}`,
+        },
+        async () => { await reloadPrinters(); await claimPrinters(); },
+      )
+      .subscribe((status) => log(`realtime[${rid.slice(0, 8)}]:`, status)),
+  );
 
   // Reset any in_progress jobs that belong to us but predate this process —
   // they were probably interrupted by a crash/restart. Mark them pending so
@@ -221,7 +248,9 @@ async function main() {
 
   process.on("SIGINT", async () => {
     log("shutting down…");
-    try { await supabase.removeChannel(channel); } catch {}
+    for (const channel of channels) {
+      try { await supabase.removeChannel(channel); } catch {}
+    }
     process.exit(0);
   });
 }

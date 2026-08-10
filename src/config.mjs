@@ -11,7 +11,7 @@ export function loadConfig() {
   const p = process.env.PRINT_BRIDGE_CONFIG ?? DEFAULT_PATH;
   if (!fs.existsSync(p)) {
     console.error(`No config file at ${p}.`);
-    console.error("Create it with: { supabase_url, service_role_key, restaurant_id }");
+    console.error("Create it with: { supabase_url, service_role_key, restaurant_ids }");
     process.exit(2);
   }
   let raw;
@@ -21,17 +21,29 @@ export function loadConfig() {
     console.error(`Invalid JSON in ${p}: ${e.message}`);
     process.exit(2);
   }
-  const required = ["supabase_url", "service_role_key", "restaurant_id"];
-  for (const k of required) {
+  for (const k of ["supabase_url", "service_role_key"]) {
     if (!raw[k] || typeof raw[k] !== "string") {
       console.error(`Missing/invalid ${k} in ${p}`);
       process.exit(2);
     }
   }
+  // One bridge process can serve several restaurants (e.g. sucursales sharing
+  // a PC): `restaurant_ids` is an array; the older single `restaurant_id`
+  // string keeps working.
+  let restaurantIds;
+  if (Array.isArray(raw.restaurant_ids)) {
+    restaurantIds = raw.restaurant_ids.filter((id) => typeof id === "string" && id.trim());
+  } else if (typeof raw.restaurant_id === "string" && raw.restaurant_id.trim()) {
+    restaurantIds = [raw.restaurant_id];
+  }
+  if (!restaurantIds || restaurantIds.length === 0) {
+    console.error(`Missing/invalid restaurant_ids (or legacy restaurant_id) in ${p}`);
+    process.exit(2);
+  }
   return {
     supabaseUrl: raw.supabase_url,
     serviceRoleKey: raw.service_role_key,
-    restaurantId: raw.restaurant_id,
+    restaurantIds,
     label: raw.label ?? `bridge@${os.hostname()}`,
     pollIntervalMs: Number(raw.poll_interval_ms ?? 30_000),
     maxAttempts: Number(raw.max_attempts ?? 3),

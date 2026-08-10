@@ -18,7 +18,14 @@ const PC858_MAP = (() => {
     ["Ö", 0x99], ["Ü", 0x9a], ["ø", 0x9b], ["£", 0x9c], ["Ø", 0x9d],
     ["á", 0xa0], ["í", 0xa1], ["ó", 0xa2], ["ú", 0xa3], ["ñ", 0xa4],
     ["Ñ", 0xa5], ["ª", 0xa6], ["º", 0xa7], ["¿", 0xa8], ["¡", 0xad],
-    ["«", 0xae], ["»", 0xaf], ["€", 0xd5],
+    ["«", 0xae], ["»", 0xaf], ["€", 0xd5], ["·", 0xfa],
+    // Uppercase accented vowels (synced from escpos.ts): station names go
+    // through .toUpperCase() on split comandas (158), and "CAFÉ"/"MARISCOS
+    // FRÍOS" must render on bridge printers too, not as "?".
+    ["Á", 0xb5], ["Â", 0xb6], ["À", 0xb7], ["Ê", 0xd2], ["Ë", 0xd3],
+    ["È", 0xd4], ["Í", 0xd6], ["Î", 0xd7], ["Ï", 0xd8], ["Ì", 0xde],
+    ["Ó", 0xe0], ["Ô", 0xe2], ["Ò", 0xe3], ["Ú", 0xe9], ["Û", 0xea],
+    ["Ù", 0xeb],
     [" ", 0x20], ["\n", 0x0a], ["\t", 0x09], ["\r", 0x0d],
   ];
   for (const [ch, code] of ext) map[ch] = code;
@@ -59,16 +66,57 @@ export class EscPos {
   }
   style(s = {}) {
     let n = 0;
+    if (s.font === "B") n |= 0b0000_0001;
     if (s.bold) n |= 0b0000_1000;
     if (s.doubleHeight) n |= 0b0001_0000;
     if (s.doubleWidth) n |= 0b0010_0000;
     if (s.underline) n |= 0b1000_0000;
-    return this.push(ESC, 0x21, n);
+    this.push(ESC, 0x21, n);
+    // ESC ! reselects font A/B (bit 0), so font C must be re-asserted with
+    // ESC M 2 after every style change (mirror of escpos.ts).
+    if (s.font === "C") this.push(ESC, 0x4d, 2);
+    return this;
+  }
+  // ESC G n — double-strike (darker print). Unaffected by ESC ! n.
+  doubleStrike(on) { return this.push(ESC, 0x47, on ? 1 : 0); }
+  // ESC SP n — right-side character spacing in dots (0..255).
+  charSpacing(dots) {
+    return this.push(ESC, 0x20, Math.max(0, Math.min(255, Math.round(dots))));
+  }
+  // ESC 3 n / ESC 2 — line spacing (n/180") or font default.
+  lineSpacing(dots) {
+    if (dots > 0) return this.push(ESC, 0x33, Math.min(255, Math.round(dots)));
+    return this.push(ESC, 0x32);
+  }
+  // GS ! n — character magnification, w/h in 1..8 (high/low nibble).
+  magnify(w, h) {
+    const cw = Math.max(1, Math.min(8, Math.round(w)));
+    const ch = Math.max(1, Math.min(8, Math.round(h)));
+    return this.push(GS, 0x21, ((cw - 1) << 4) | (ch - 1));
   }
   text(s) { return this.push(...encodeText(s)); }
   line(s = "") { if (s) this.text(s); return this.push(LF); }
   feed(n = 1) { for (let i = 0; i < n; i++) this.push(LF); return this; }
   rule(chars, ch = "-") { return this.line(ch.repeat(chars)); }
+  // Two-column line: label flush-left, value flush-right, padded to `width`.
+  twoCol(label, value, width) {
+    const v = value.slice(0, Math.max(0, width - 1));
+    const maxLabel = Math.max(0, width - v.length - 1);
+    const l = label.length > maxLabel ? label.slice(0, maxLabel - 1) + "…" : label;
+    const pad = width - l.length - v.length;
+    return this.line(l + " ".repeat(Math.max(1, pad)) + v);
+  }
+  // GS v 0 — raster bit image (1-bit rows, MSB first, 1 = black dot).
+  // Loop (not spread): data can be several KB.
+  raster(data, widthBytes, height) {
+    this.push(
+      GS, 0x76, 0x30, 0x00,
+      widthBytes & 0xff, (widthBytes >> 8) & 0xff,
+      height & 0xff, (height >> 8) & 0xff,
+    );
+    for (let i = 0; i < data.length; i++) this.bytes.push(data[i] & 0xff);
+    return this;
+  }
   cut() { return this.push(GS, 0x56, 0x01); }
   build() { return Buffer.from(this.bytes); }
 }

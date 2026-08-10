@@ -69,7 +69,7 @@ Create the config file at `~/.fujun-bridge/config.json` (Windows:
 {
   "supabase_url":     "https://<project>.supabase.co",
   "service_role_key": "eyJ...",
-  "restaurant_id":    "00000000-0000-0000-0000-000000000000",
+  "restaurant_ids":   ["00000000-0000-0000-0000-000000000000"],
   "label":            "bridge@cocina",
   "poll_interval_ms": 30000,
   "max_attempts":     3
@@ -79,8 +79,16 @@ Create the config file at `~/.fujun-bridge/config.json` (Windows:
 Where to get the values:
 
 - `supabase_url`, `service_role_key` → Supabase Dashboard → **Project Settings → API**
-- `restaurant_id` → the app's settings → Impresoras page shows the restaurant slug; the UUID is in your dashboard URL or `restaurants` table.
+- `restaurant_ids` → the app's settings → Impresoras page shows the restaurant slug; the UUID is in your dashboard URL or `restaurants` table.
 - `label` → free-form, helps you tell bridges apart in logs.
+
+**One PC serving several restaurants (sucursales):** one bridge process can
+drive the printers of multiple restaurants — add each restaurant's UUID to
+the `restaurant_ids` array and restart the bridge. **Do not** create a
+second config file over the first one: overwriting the config with only the
+new sucursal's id silently stops printing for the original restaurant.
+The legacy single-restaurant form `"restaurant_id": "uuid"` is still
+accepted for existing installs.
 
 **Security:** the service-role key has full project access. Lock the file
 down:
@@ -102,7 +110,7 @@ print-bridge-win-x64.exe
 You should see:
 
 ```
-[2026-05-21T18:42:01.000Z] fujun-bridge starting (label=bridge@cocina, restaurant=…)
+[2026-05-21T18:42:01.000Z] fujun-bridge v0.2.0 starting (label=bridge@cocina, restaurants=…)
 [2026-05-21T18:42:01.500Z] tracking 1 wifi printer(s): Cocina@192.168.1.100:9100
 [2026-05-21T18:42:01.700Z] realtime: SUBSCRIBED
 ```
@@ -231,6 +239,7 @@ journalctl -u fujun-bridge -f   # follow logs
 | `realtime: CONNECTING` (never SUBSCRIBED) | No internet, wrong `supabase_url`, or wrong key. |
 | `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. |
 | Jobs queue but never print | Bridge isn't running, or printer is `is_active=false` in the DB. |
+| App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Downloads never auto-update: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
 | macOS: "cannot be opened because the developer cannot be verified" | `xattr -d com.apple.quarantine print-bridge-macos-arm64`, then run again. |
 
 ---
