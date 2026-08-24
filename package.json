@@ -1,6 +1,6 @@
 {
   "name": "@restaurant-saas/print-bridge",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Local WiFi print bridge — forwards print_jobs from Supabase to ESC/POS printers on the LAN over TCP:9100.",
   "type": "module",

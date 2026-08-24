@@ -299,7 +299,11 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
       };
       row("Subtotal", f.subtotal);
       if (f.delivery_fee && f.delivery_fee > 0) row("Delivery", f.delivery_fee);
-      if (f.tip && f.tip > 0) row("Propina", f.tip);
+      // Matches kitchen-ticket.ts exactly: the charged tip is labeled
+      // "(sugerida)" when the restaurant runs the propina-sugerida setting.
+      if (f.tip && f.tip > 0) {
+        row(f.tip_is_suggested ? "Propina (sugerida)" : "Propina", f.tip);
+      }
       if (f.adjustment && f.adjustment !== 0) {
         // Matches kitchen-ticket.ts exactly: an EMPTY note falls back to
         // "Ajuste" too (`?.slice() || "Ajuste"`), not to a blank label.
@@ -322,6 +326,20 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     const totalStr = formatMoney(f.total, f.currency, usdSymbol);
     esc.line(`TOTAL ${totalStr}`.slice(0, COLS_BIG));
     plain();
+
+    // Impuestos incluidos (186) — disclosure rows INSIDE the total. Kept in
+    // sync with kitchen-ticket.ts (both renderers consume the same payload).
+    if (f.included_taxes && f.included_taxes.length > 0) {
+      esc.align("left");
+      med();
+      for (const t of f.included_taxes) {
+        const label = `Incluye ${t.label}`.slice(0, 20);
+        const v = formatMoney(t.amount, f.currency, usdSymbol);
+        const pad = Math.max(1, COLS - label.length - v.length);
+        esc.line(label + " ".repeat(pad) + v);
+      }
+      plain();
+    }
 
     // Propina sugerida (168) — optional block under the real total.
     if (
@@ -395,6 +413,19 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
         .map((cur) => f.totals_by_currency.find((t) => t.currency === cur))
         .filter(Boolean);
 
+      // Second value row: same currencies, suggested tip included. Same gates
+      // as the suggestion block above, and only when every column has a figure.
+      const tipRow =
+        L.propina_sugerida !== false &&
+        f.suggested_tip != null &&
+        f.suggested_tip > 0 &&
+        f.totals_by_currency_with_tip
+          ? cells.map((c) =>
+              f.totals_by_currency_with_tip.find((t) => t.currency === c.currency)
+            )
+          : [];
+      const withTip = tipRow.every((c) => !!c) ? tipRow : [];
+
       if (cells.length > 0) {
         med();
         esc.rule(COLS);
@@ -405,15 +436,30 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
         plain();
 
         const colWidth = Math.floor(COLS / cells.length);
+        const valueRow = (row) =>
+          row
+            .map((c) => centerIn(formatMoney(c.amount, c.currency, usdSymbol), colWidth))
+            .join("");
         esc.align("left");
         med({ bold: true });
         esc.line(cells.map((c) => centerIn(c.currency, colWidth)).join(""));
+        if (withTip.length > 0) {
+          med({ bold: true });
+          esc.line("SIN PROPINA");
+        }
         med();
-        esc.line(
-          cells
-            .map((c) => centerIn(formatMoney(c.amount, c.currency, usdSymbol), colWidth))
-            .join("")
-        );
+        esc.line(valueRow(cells));
+        if (withTip.length > 0) {
+          med({ bold: true });
+          esc.line(
+            (f.suggested_tip_percent != null
+              ? `CON PROPINA ${f.suggested_tip_percent}%`
+              : "CON PROPINA"
+            ).slice(0, COLS)
+          );
+          med();
+          esc.line(valueRow(withTip));
+        }
         plain();
       }
     }

@@ -17,7 +17,34 @@ each job to its target printer. Supports two transports:
 
 ---
 
-## Install (recommended: prebuilt binary)
+## Install (recommended: one-line installer + pairing code)
+
+Since 0.3.0 the whole setup is one command. In the app, go to
+**Configuración → Impresoras → Vincular bridge**, generate a pairing code,
+and paste the command it shows into the restaurant PC:
+
+```powershell
+# Windows (PowerShell)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://<app>/bridge/install.ps1))) -Code XXXX-XXXX -Url https://<app>"
+```
+
+```bash
+# macOS / Linux
+curl -fsSL https://<app>/bridge/install.sh | sh -s -- --code XXXX-XXXX --url https://<app>
+```
+
+That downloads the latest binary, exchanges the code for **scoped device
+credentials** (no Supabase keys involved), writes the config itself, and
+registers the bridge to start on boot (Task Scheduler / launchd / systemd).
+Codes are single-use and expire in 15 minutes.
+
+**One PC serving several restaurants (sucursales):** generate a code in each
+restaurant and run the same command once per code — the pairings accumulate
+onto the same bridge.
+
+The sections below cover manual installation.
+
+## Manual install (prebuilt binary)
 
 The bridge is shipped as a single-file executable — no Node, no npm, no
 dependencies to install.
@@ -60,42 +87,40 @@ file in Finder → **Open** → confirm. Or via terminal:
 xattr -d com.apple.quarantine print-bridge-macos-arm64
 ```
 
-### 4. Configure
+### 4. Pair
 
-Create the config file at `~/.fujun-bridge/config.json` (Windows:
-`C:\Users\<you>\.fujun-bridge\config.json`):
+Generate a pairing code in the app (**Configuración → Impresoras →
+Vincular bridge**) and run:
+
+```bash
+./print-bridge-macos-arm64 pair XXXX-XXXX --url https://<app>
+```
+
+That writes `~/.fujun-bridge/config.json` (Windows:
+`C:\Users\<you>\.fujun-bridge\config.json`) with the device credentials —
+an anon key plus a per-device auth account that RLS confines to this
+restaurant's printers and print jobs:
 
 ```json
 {
-  "supabase_url":     "https://<project>.supabase.co",
-  "service_role_key": "eyJ...",
-  "restaurant_ids":   ["00000000-0000-0000-0000-000000000000"],
-  "label":            "bridge@cocina",
-  "poll_interval_ms": 30000,
-  "max_attempts":     3
+  "supabase_url":    "https://<project>.supabase.co",
+  "anon_key":        "sb_publishable_...",
+  "device_email":    "bridge-<id>@devices.andescocina.com",
+  "device_password": "<random>",
+  "restaurants":     [{ "id": "<uuid>", "bridge_token_id": "<uuid>" }],
+  "label":           "bridge@cocina"
 }
 ```
 
-Where to get the values:
+Optional keys: `"poll_interval_ms": 30000`, `"max_attempts": 3`.
 
-- `supabase_url`, `service_role_key` → Supabase Dashboard → **Project Settings → API**
-- `restaurant_ids` → the app's settings → Impresoras page shows the restaurant slug; the UUID is in your dashboard URL or `restaurants` table.
-- `label` → free-form, helps you tell bridges apart in logs.
+**One PC serving several restaurants (sucursales):** generate a code in each
+restaurant and run `pair` once per code — restaurants accumulate in the
+existing config, on the same device account.
 
-**One PC serving several restaurants (sucursales):** one bridge process can
-drive the printers of multiple restaurants — add each restaurant's UUID to
-the `restaurant_ids` array and restart the bridge. **Do not** create a
-second config file over the first one: overwriting the config with only the
-new sucursal's id silently stops printing for the original restaurant.
-The legacy single-restaurant form `"restaurant_id": "uuid"` is still
-accepted for existing installs.
-
-**Security:** the service-role key has full project access. Lock the file
-down:
-
-```bash
-chmod 600 ~/.fujun-bridge/config.json   # macOS / Linux
-```
+**Legacy configs** (`service_role_key` + `restaurant_ids`) still run, with a
+deprecation warning. Re-pair to migrate: the service-role key is scheduled
+to be rotated, at which point old configs stop working.
 
 ### 5. Run
 
@@ -277,18 +302,35 @@ the bytes and dumps them to stdout.
 
 ---
 
+## Printer discovery (0.4.0)
+
+In device mode the bridge periodically scans its local subnets for printers
+answering on TCP:9100 and enumerates the PC's installed spooler printers
+(`Get-Printer` / `lpstat -e`), reporting the findings to the app (RPC
+`bridge_report_discoveries`, migration 201). The app uses them to prefill
+the WiFi printer form, suggest a one-click fix when a printer's DHCP
+address changes, and offer a dropdown of exact spooler names. Scans run at
+startup, every 15 minutes, and (debounced) after a wifi print fails with a
+connection error. The scan is light: ≤32 concurrent connection probes,
+port 9100 only, /24 max per interface, done in a few seconds. Legacy
+service-role configs don't report (no device identity to attach it to).
+
 ## Security note
 
-The bridge currently authenticates with the **service-role key** pasted into
-its local config file. The service-role key has full admin access to your
-Supabase project. Mitigations in place:
+Since 0.3.0 the bridge authenticates as a **per-device auth account**
+provisioned through the pairing flow (migration 200). What that means:
 
-- The config file is documented to be `chmod 600`.
-- The `bridge_tokens` table is in the schema and reserved for a future
-  hardening pass that will swap service-role for scoped tokens via RPC
-  functions, limiting what a compromised bridge can do.
+- The config file holds the public anon key plus device credentials that RLS
+  confines to the paired restaurants' `printers` (read-only) and
+  `print_jobs` (read + status transitions). Printer claims/heartbeats go
+  through two `SECURITY DEFINER` RPCs, so a compromised device cannot
+  rewrite printer connection settings, deactivate printers, or read anything
+  else in the database.
+- Revoking a bridge in the app (Configuración → Impresoras → Bridges
+  vinculados) cuts it off immediately — the RLS helper re-checks
+  `revoked_at` on every query and every realtime event.
+- The pair CLI writes the config with `chmod 600`.
 
-If this is a concern in your environment, treat each restaurant's bridge PC
-as you would any other endpoint holding admin credentials: physical
-security, no shared logins, no exposed RDP/SSH, automatic updates on the
-OS.
+Legacy configs carried the **service-role key** (full project access). They
+still run during the migration window; once the fleet is re-paired, that key
+gets rotated and old configs stop authenticating entirely.

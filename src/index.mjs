@@ -7,22 +7,20 @@
  * to that printer over TCP:9100.
  *
  * One process can drive many printers across one or more restaurants on the
- * same PC (e.g. a restaurant and its sucursal): list every restaurant in
- * `restaurant_ids`. The legacy single `restaurant_id` string still works.
+ * same PC (e.g. a restaurant and its sucursal): run `pair` once per
+ * restaurant — the same device account accumulates them.
  *
- * Config: ~/.fujun-bridge/config.json (or $PRINT_BRIDGE_CONFIG):
- *   {
- *     "supabase_url":      "https://xxxx.supabase.co",
- *     "service_role_key":  "eyJhbGc...",     // KEEP THIS SECRET
- *     "restaurant_ids":    ["uuid", ...],    // or legacy "restaurant_id": "uuid"
- *     "label":             "bridge@cocina",  // optional
- *     "poll_interval_ms":  30000,            // optional, fallback poll
- *     "max_attempts":      3                 // optional
- *   }
+ * Setup (0.3.0+): `print-bridge pair <CODIGO> --url <app-url>` exchanges a
+ * staff-generated pairing code for a scoped device account (anon key + auth
+ * user confined by RLS to this restaurant's printers/print_jobs) and writes
+ * ~/.fujun-bridge/config.json itself. See config.mjs for both config shapes;
+ * legacy service-role configs still run, with a deprecation warning.
  */
 
 import { createClient } from "@supabase/supabase-js";
 import { loadConfig } from "./config.mjs";
+import { runPair } from "./pair.mjs";
+import { startDiscovery, isConnectionError } from "./discover.mjs";
 import { VERSION } from "./version.mjs";
 import { renderKitchenTicket } from "./template.mjs";
 import { renderCajaReport } from "./caja-report.mjs";
@@ -30,16 +28,62 @@ import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import crypto from "node:crypto";
 
-const cfg = loadConfig();
-const supabase = createClient(cfg.supabaseUrl, cfg.serviceRoleKey, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
+const argv = process.argv.slice(2);
+if (argv[0] === "pair") {
+  await runPair(argv.slice(1));
+  process.exit(0);
+}
 
-const DEVICE_ID = `bridge:${crypto.createHash("sha1").update(cfg.label).digest("hex").slice(0, 16)}`;
+const cfg = loadConfig();
+const supabase = createClient(
+  cfg.supabaseUrl,
+  cfg.mode === "device" ? cfg.anonKey : cfg.serviceRoleKey,
+  {
+    // Device mode: supabase-js refreshes the 1h access token on its own and
+    // forwards each new token to realtime — no manual auth plumbing here.
+    auth: {
+      autoRefreshToken: cfg.mode === "device",
+      persistSession: false,
+      detectSessionInUrl: false,
+    },
+  },
+);
+
+// Device mode: assigned after sign-in as `bridge:<auth user id>` (stable
+// across label edits, and what the claim/heartbeat RPCs stamp server-side).
+// Legacy mode keeps the historical label-hash id.
+let DEVICE_ID = `bridge:${crypto.createHash("sha1").update(cfg.label).digest("hex").slice(0, 16)}`;
+
+/**
+ * Signs in with the device credentials, retrying forever on transient errors
+ * (the PC may boot before its network). A 400 means the credentials are
+ * gone/revoked — that's fatal and needs a re-pair, so exit with a clear
+ * message rather than hammering auth.
+ */
+async function signInDevice() {
+  let delay = 5_000;
+  for (;;) {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: cfg.deviceEmail,
+      password: cfg.devicePassword,
+    });
+    if (!error) return data.user.id;
+    if (error.status === 400) {
+      console.error("Credenciales del bridge inválidas o revocadas.");
+      console.error("Vinculá de nuevo con: print-bridge pair <CODIGO> --url <url de la app>");
+      process.exit(3);
+    }
+    log(`auth: ${error.message} — reintento en ${Math.round(delay / 1000)}s`);
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 2, 5 * 60_000);
+  }
+}
 
 // id -> { transport: 'wifi' | 'usb_bridge', name, host?, port?, os_printer_name? }
 const printers = new Map();
 const inFlight = new Set();
+// Discovery reporter (device mode only) — see discover.mjs.
+let discovery = null;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -97,6 +141,17 @@ async function claimPrinters() {
   // Atomically claim our printers to this bridge so the UI shows it's online.
   const ids = Array.from(printers.keys());
   if (ids.length === 0) return;
+  if (cfg.mode === "device") {
+    // Devices have no UPDATE policy on printers (a compromised one must not
+    // be able to rewrite `connection`); the SECURITY DEFINER RPC does the
+    // claim with the same unclaimed-or-mine-or-stale guard (migration 200).
+    const { error } = await supabase.rpc("bridge_claim_printers", {
+      p_printer_ids: ids,
+      p_version: VERSION,
+    });
+    if (error) log("ERROR claiming printers:", error.message);
+    return;
+  }
   await supabase
     .from("printers")
     .update({
@@ -114,6 +169,16 @@ async function heartbeat() {
   // bridge_version rides along on every heartbeat, not just the claim: an
   // upgraded binary restarting onto printers it already owns wouldn't
   // otherwise refresh the number until something re-claimed them.
+  if (cfg.mode === "device") {
+    // Also stamps bridge_tokens.last_seen_at — the CRM platform-health
+    // "Bridge caído" rollups read it.
+    const { error } = await supabase.rpc("bridge_heartbeat", {
+      p_printer_ids: ids,
+      p_version: VERSION,
+    });
+    if (error) log("ERROR heartbeat:", error.message);
+    return;
+  }
   await supabase
     .from("printers")
     .update({ last_seen_at: new Date().toISOString(), bridge_version: VERSION })
@@ -158,6 +223,11 @@ async function processJob(job) {
     log(`ok job ${job.id} (${bytes.length} bytes)`);
   } catch (e) {
     log(`FAIL job ${job.id}: ${e.message}`);
+    // A wifi printer that stopped answering may have moved to a new DHCP
+    // address — rescan (debounced) so the app can suggest the fix.
+    if (printer.transport === "wifi" && isConnectionError(e)) {
+      discovery?.triggerFailureRescan();
+    }
     // Bump attempts; mark failed when too many.
     const { data: cur } = await supabase
       .from("print_jobs")
@@ -199,9 +269,28 @@ async function drainPending() {
 }
 
 async function main() {
-  log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, restaurants=${cfg.restaurantIds.join(", ")})`);
+  log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, mode=${cfg.mode}, restaurants=${cfg.restaurantIds.join(", ")})`);
+  if (cfg.mode === "device") {
+    const userId = await signInDevice();
+    DEVICE_ID = `bridge:${userId}`;
+    log(`signed in as device ${userId}`);
+    // If the session ever dies (refresh failed after a long offline stretch),
+    // sign in again — the queries below would otherwise 401 forever. Guarded:
+    // our own re-sign-in fires SIGNED_IN, which must not loop.
+    let reauthing = false;
+    supabase.auth.onAuthStateChange((_event, session) => {
+      if (session || reauthing) return;
+      reauthing = true;
+      void signInDevice().then(() => { reauthing = false; });
+    });
+  }
   await reloadPrinters();
   await claimPrinters();
+  if (cfg.mode === "device") {
+    discovery = startDiscovery({ supabase, log, label: cfg.label, version: VERSION });
+  } else {
+    log("discovery: desactivado en modo legacy (service role) — requiere cuenta de dispositivo; re-pareá con: print-bridge pair <CODIGO>");
+  }
   await drainPending();
 
   // One channel per restaurant: postgres_changes filters only support a
@@ -248,6 +337,7 @@ async function main() {
 
   process.on("SIGINT", async () => {
     log("shutting down…");
+    discovery?.stop();
     for (const channel of channels) {
       try { await supabase.removeChannel(channel); } catch {}
     }
