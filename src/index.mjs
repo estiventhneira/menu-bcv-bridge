@@ -165,7 +165,10 @@ async function claimPrinters() {
 
 async function heartbeat() {
   const ids = Array.from(printers.keys());
-  if (ids.length === 0) return;
+  // NOTE: no early return on zero printers in device mode — a freshly paired
+  // bridge with no printers configured yet must still stamp
+  // bridge_tokens.last_seen_at, or the settings page shows "nunca conectado"
+  // for a bridge that is alive and waiting (0.4.1 field report).
   // bridge_version rides along on every heartbeat, not just the claim: an
   // upgraded binary restarting onto printers it already owns wouldn't
   // otherwise refresh the number until something re-claimed them.
@@ -179,6 +182,7 @@ async function heartbeat() {
     if (error) log("ERROR heartbeat:", error.message);
     return;
   }
+  if (ids.length === 0) return; // legacy mode has no bridge_tokens row to stamp
   await supabase
     .from("printers")
     .update({ last_seen_at: new Date().toISOString(), bridge_version: VERSION })
