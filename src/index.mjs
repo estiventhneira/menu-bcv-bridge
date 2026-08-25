@@ -92,7 +92,7 @@ function log(...args) {
 async function reloadPrinters() {
   const { data, error } = await supabase
     .from("printers")
-    .select("id, name, transport, connection, is_active, chars_per_line, print_settings")
+    .select("id, name, transport, connection, is_active, chars_per_line, print_settings, claimed_by_device_id")
     .in("restaurant_id", cfg.restaurantIds)
     .in("transport", ["wifi", "usb_bridge"])
     .eq("is_active", true);
@@ -118,6 +118,7 @@ async function reloadPrinters() {
         port: Number(c.port) || 9100,
         chars_per_line: charsPerLine,
         print_settings: printSettings,
+        claimed_by: p.claimed_by_device_id ?? null,
       });
     } else if (p.transport === "usb_bridge") {
       if (!c.os_printer_name) continue;
@@ -127,32 +128,52 @@ async function reloadPrinters() {
         os_printer_name: c.os_printer_name,
         chars_per_line: charsPerLine,
         print_settings: printSettings,
+        claimed_by: p.claimed_by_device_id ?? null,
       });
     }
   }
   const describe = (p) => p.transport === "wifi"
     ? `${p.name}@${p.host}:${p.port}`
     : `${p.name}@spooler:${p.os_printer_name}`;
-  log(`tracking ${printers.size} printer(s):`,
-    Array.from(printers.values()).map(describe).join(", ") || "(none)");
+  // Only announce when the tracked set actually changed — this runs on every
+  // printers event and used to flood the console during setup.
+  const signature = Array.from(printers.values()).map(describe).sort().join(", ") || "(none)";
+  if (signature !== lastTrackedSignature) {
+    lastTrackedSignature = signature;
+    log(`tracking ${printers.size} printer(s):`, signature);
+  }
 }
+let lastTrackedSignature = null;
 
 async function claimPrinters() {
   // Atomically claim our printers to this bridge so the UI shows it's online.
-  const ids = Array.from(printers.keys());
+  //
+  // CRITICAL: only write for printers we don't already hold. A claim write is
+  // itself a `printers` UPDATE, which realtime echoes back to our own
+  // subscription, whose handler claims again — an unconditional claim turns
+  // that echo into a self-sustaining write loop (0.4.2 field incident: the
+  // console "went crazy" while printers were being added). Claiming only
+  // not-mine rows makes the steady state write nothing, so the echo dies.
+  const ids = Array.from(printers.entries())
+    .filter(([, p]) => p.claimed_by !== DEVICE_ID)
+    .map(([id]) => id);
   if (ids.length === 0) return;
   if (cfg.mode === "device") {
     // Devices have no UPDATE policy on printers (a compromised one must not
     // be able to rewrite `connection`); the SECURITY DEFINER RPC does the
     // claim with the same unclaimed-or-mine-or-stale guard (migration 200).
-    const { error } = await supabase.rpc("bridge_claim_printers", {
+    const { data, error } = await supabase.rpc("bridge_claim_printers", {
       p_printer_ids: ids,
       p_version: VERSION,
     });
     if (error) log("ERROR claiming printers:", error.message);
+    for (const id of data ?? []) {
+      const p = printers.get(id);
+      if (p) p.claimed_by = DEVICE_ID;
+    }
     return;
   }
-  await supabase
+  const { data } = await supabase
     .from("printers")
     .update({
       claimed_by_device_id: DEVICE_ID,
@@ -160,7 +181,12 @@ async function claimPrinters() {
       bridge_version: VERSION,
     })
     .in("id", ids)
-    .or(`claimed_by_device_id.is.null,claimed_by_device_id.eq.${DEVICE_ID}`);
+    .or(`claimed_by_device_id.is.null,claimed_by_device_id.eq.${DEVICE_ID}`)
+    .select("id");
+  for (const row of data ?? []) {
+    const p = printers.get(row.id);
+    if (p) p.claimed_by = DEVICE_ID;
+  }
 }
 
 async function heartbeat() {
@@ -272,6 +298,38 @@ async function drainPending() {
   for (const j of data ?? []) await processJob(j);
 }
 
+// Columns that change what/how the bridge prints. Heartbeat/claim writes
+// (claimed_*, last_seen_at, bridge_version, updated_at) are deliberately NOT
+// here: those are our own echoes coming back through realtime, and reacting
+// to them is what fed the reload/claim write loop.
+const PRINTER_CONFIG_COLS = [
+  "name", "transport", "connection", "is_active", "chars_per_line", "print_settings",
+];
+
+function printerEventMatters(payload) {
+  if (payload.eventType !== "UPDATE") return true; // INSERT / DELETE always
+  const o = payload.old;
+  const n = payload.new;
+  // Defensive: without the full old row (REPLICA IDENTITY not FULL) we can't
+  // tell, so err on reloading.
+  if (!o || !n || o.id === undefined) return true;
+  return PRINTER_CONFIG_COLS.some((k) => JSON.stringify(o[k]) !== JSON.stringify(n[k]));
+}
+
+// Coalesce bursts (adding several printers/stations fires many events in
+// seconds) into one reload+claim, and never run them concurrently.
+let printersRefreshTimer = null;
+function schedulePrintersRefresh() {
+  if (printersRefreshTimer) return;
+  printersRefreshTimer = setTimeout(() => {
+    printersRefreshTimer = null;
+    void (async () => {
+      await reloadPrinters();
+      await claimPrinters();
+    })().catch((e) => log("ERROR refreshing printers:", e.message));
+  }, 1_000);
+}
+
 async function main() {
   log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, mode=${cfg.mode}, restaurants=${cfg.restaurantIds.join(", ")})`);
   if (cfg.mode === "device") {
@@ -323,7 +381,7 @@ async function main() {
           table: "printers",
           filter: `restaurant_id=eq.${rid}`,
         },
-        async () => { await reloadPrinters(); await claimPrinters(); },
+        (payload) => { if (printerEventMatters(payload)) schedulePrintersRefresh(); },
       )
       .subscribe((status) => log(`realtime[${rid.slice(0, 8)}]:`, status)),
   );
@@ -350,6 +408,18 @@ async function main() {
     process.exit(0);
   });
 }
+
+// Crash loudly and exit so the service manager (launchd/systemd/the Windows
+// wrapper) restarts us — a silently wedged bridge means no tickets print
+// until someone notices.
+process.on("unhandledRejection", (e) => {
+  console.error("FATAL unhandledRejection", e);
+  process.exit(1);
+});
+process.on("uncaughtException", (e) => {
+  console.error("FATAL uncaughtException", e);
+  process.exit(1);
+});
 
 main().catch((e) => {
   console.error("FATAL", e);
