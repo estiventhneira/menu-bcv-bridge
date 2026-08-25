@@ -16,8 +16,14 @@ import { spawn } from "node:child_process";
 
 const PROBE_PORT = 9100; // RAW/JetDirect — the only port the bridge prints to
 const CONNECT_TIMEOUT_MS = 750; // LAN RTT is <10ms; tolerates sleepy wifi printers
-const SCAN_CONCURRENCY = 32; // 254 SYNs at once trips cheap routers; 32 doesn't
-const SCAN_DEADLINE_MS = 20_000; // hard stop across all subnets
+// FIELD INCIDENT (0.4.0): 32 concurrent probes tripped a restaurant router's
+// port-scan/DoS protection and throttled the whole LAN — staff read it as the
+// app being down. Scan slow and cold: a handful of outstanding probes, a
+// breather between them, and hours between periodic sweeps. Discovery is a
+// convenience; the network it runs on is the restaurant's lifeline.
+const SCAN_CONCURRENCY = 4;
+const PROBE_GAP_MS = 150; // pause per worker between probes (~25 probes/s total)
+const SCAN_DEADLINE_MS = 120_000; // slow scan needs headroom (254 hosts ≈ 60-90s)
 const MAX_HOSTS_PER_SCAN = 1024;
 const MAX_SUBNETS = 8;
 const MAX_NET_PRINTERS = 50;
@@ -25,9 +31,9 @@ const MAX_OS_PRINTERS = 50;
 const MAX_STR = 128;
 const SPOOLER_CMD_TIMEOUT = 10_000;
 const SPOOLER_OUT_CAP = 256 * 1024;
-const PERIODIC_MS = 15 * 60_000;
+const PERIODIC_MS = 6 * 60 * 60_000; // startup + failures cover the real use cases
 const FAILURE_DELAY_MS = 10_000; // coalesce a burst of failing jobs
-const FAILURE_COOLDOWN_MS = 5 * 60_000; // dead printer retried every 30s must not scan continuously
+const FAILURE_COOLDOWN_MS = 15 * 60_000; // dead printer retried every 30s must not scan continuously
 
 // ------------------------------------------------------------
 // Connection-error classifier (used by index.mjs to decide when a
@@ -150,6 +156,8 @@ async function scanLan() {
       const host = hosts[next++];
       const hit = await probe(host, PROBE_PORT, CONNECT_TIMEOUT_MS);
       if (hit) found.push(hit);
+      // Deliberate breather — see the incident note on PROBE_GAP_MS.
+      await new Promise((r) => setTimeout(r, PROBE_GAP_MS));
     }
   };
   await Promise.all(Array.from({ length: SCAN_CONCURRENCY }, worker));

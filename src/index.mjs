@@ -286,8 +286,10 @@ async function main() {
   }
   await reloadPrinters();
   await claimPrinters();
-  if (cfg.mode === "device") {
+  if (cfg.mode === "device" && !cfg.disableDiscovery) {
     discovery = startDiscovery({ supabase, log, label: cfg.label, version: VERSION });
+  } else if (cfg.disableDiscovery) {
+    log("discovery: desactivado por config (disable_discovery)");
   } else {
     log("discovery: desactivado en modo legacy (service role) — requiere cuenta de dispositivo; re-pareá con: print-bridge pair <CODIGO>");
   }

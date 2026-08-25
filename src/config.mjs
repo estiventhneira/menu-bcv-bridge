@@ -67,6 +67,9 @@ export function loadConfig() {
     label: raw.label ?? `bridge@${os.hostname()}`,
     pollIntervalMs: Number(raw.poll_interval_ms ?? 30_000),
     maxAttempts: Number(raw.max_attempts ?? 3),
+    // Escape hatch for routers that dislike even the slow scan:
+    // { "disable_discovery": true } turns network discovery off entirely.
+    disableDiscovery: raw.disable_discovery === true,
   };
 
   // Device shape (0.3.0+)
