@@ -302,6 +302,20 @@ the bytes and dumps them to stdout.
 
 ---
 
+## Self-update (0.5.0)
+
+The bridge keeps itself current: ~90s after start and every ~6 hours
+(jittered so a release doesn't restart the whole fleet at once) it compares
+its own binary's SHA-256 against the published checksum of the latest
+release. On mismatch it downloads the new binary, verifies the checksum,
+swaps itself (Windows: rename-aside, since a running exe can't be
+overwritten), and exits — the restart wrapper / launchd / systemd relaunches
+the new build in seconds. Updates never apply while a ticket is printing.
+
+Config escape hatches: `"disable_auto_update": true` turns it off;
+`"update_repo": "owner/repo"` points a test PC at a fork's releases.
+Bridges run from source (`node src/index.mjs`) never self-update.
+
 ## Printer discovery (0.4.0)
 
 In device mode the bridge periodically scans its local subnets for printers

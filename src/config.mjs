@@ -75,6 +75,12 @@ export function loadConfig() {
     // Escape hatch for routers that dislike even the slow scan:
     // { "disable_discovery": true } turns network discovery off entirely.
     disableDiscovery: raw.disable_discovery === true,
+    // Self-update (0.5.0) escape hatches: turn it off entirely, or point a
+    // test PC at a fork's releases.
+    disableAutoUpdate: raw.disable_auto_update === true,
+    updateRepo: typeof raw.update_repo === "string" && raw.update_repo.trim()
+      ? raw.update_repo.trim()
+      : null,
   };
 
   // Device shape (0.3.0+)

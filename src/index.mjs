@@ -21,6 +21,7 @@ import { createClient } from "@supabase/supabase-js";
 import { loadConfig } from "./config.mjs";
 import { runPair } from "./pair.mjs";
 import { startDiscovery, isConnectionError } from "./discover.mjs";
+import { startSelfUpdate } from "./self-update.mjs";
 import { VERSION } from "./version.mjs";
 import { renderKitchenTicket } from "./template.mjs";
 import { renderCajaReport } from "./caja-report.mjs";
@@ -360,6 +361,16 @@ async function main() {
   }
   await reloadPrinters();
   await claimPrinters();
+  // Self-update runs in BOTH auth modes — it's what carries legacy installs
+  // forward too. Applies only between prints, never mid-ticket.
+  const selfUpdate = startSelfUpdate({
+    log,
+    isBusy: () => inFlight.size > 0,
+    repo: cfg.updateRepo,
+    disabled: cfg.disableAutoUpdate,
+  });
+  process.on("SIGINT", () => selfUpdate.stop());
+
   if (cfg.mode === "device" && !cfg.disableDiscovery) {
     discovery = startDiscovery({ supabase, log, label: cfg.label, version: VERSION });
   } else if (cfg.disableDiscovery) {
