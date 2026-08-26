@@ -316,6 +316,18 @@ function printerEventMatters(payload) {
   return PRINTER_CONFIG_COLS.some((k) => JSON.stringify(o[k]) !== JSON.stringify(n[k]));
 }
 
+// One pending sweep max: a realtime job event arrived, so any siblings whose
+// events were dropped are sitting pending — pick them up in seconds, not at
+// the next 30s poll. processJob's atomic claim makes double-processing safe.
+let siblingDrainTimer = null;
+function scheduleSiblingDrain() {
+  if (siblingDrainTimer) return;
+  siblingDrainTimer = setTimeout(() => {
+    siblingDrainTimer = null;
+    void drainPending();
+  }, 2_000);
+}
+
 // Coalesce bursts (adding several printers/stations fires many events in
 // seconds) into one reload+claim, and never run them concurrently.
 let printersRefreshTimer = null;
@@ -371,7 +383,14 @@ async function main() {
           table: "print_jobs",
           filter: `restaurant_id=eq.${rid}`,
         },
-        (payload) => { void processJob(payload.new); },
+        (payload) => {
+          void processJob(payload.new);
+          // Realtime drops some rows of a multi-job burst (field report:
+          // an order's kitchen ticket arrived, its receipts didn't and sat
+          // until the 30s poll). At least one sibling almost always lands,
+          // so any arrival also sweeps for stragglers a moment later.
+          scheduleSiblingDrain();
+        },
       )
       .on(
         "postgres_changes",
