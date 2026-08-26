@@ -143,7 +143,13 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
   if (p.kind === "kitchen_modification") {
     esc.align("center");
     big({ bold: true });
-    esc.line(p.modification_type === "cancelled" ? "ANULADO" : "AGREGADO");
+    esc.line(
+      p.modification_type === "cancelled"
+        ? "ANULADO"
+        : p.modification_type === "table_changed"
+          ? "CAMBIO DE MESA"
+          : "AGREGADO",
+    );
     plain();
     esc.feed(1);
   } else if (p.kind === "test") {
@@ -167,7 +173,15 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     esc.align("center");
     big({ bold: true });
     if (showOrdenNumero) esc.line(`ORDEN #${p.order_number}`);
-    if (showTipoOrden) esc.line(formatHeader(p));
+    if (showTipoOrden) {
+      esc.line(formatHeader(p));
+      if (p.modification_type === "table_changed" && p.previous_table_label) {
+        // The big header already shows the NEW table; cooks also need the old
+        // one to know which pending dishes this refers to.
+        med({ bold: true });
+        esc.line(`ANTES: MESA ${p.previous_table_label}`);
+      }
+    }
     plain();
     esc.feed(1);
   }
@@ -186,8 +200,23 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
   if (L.mesero !== false && p.waiter_name) {
     for (const ln of wrap(`Mesero: ${p.waiter_name}`, COLS)) esc.line(ln);
   }
-  if (L.cliente !== false && p.customer_name && p.kind === "customer_ticket") {
+  // Customer name: shown on every real ticket (caja, kitchen, modification)
+  // whenever one was entered — lets the counter match bag to customer.
+  // Kept in sync with kitchen-ticket.ts (a stale kind-filter here silently
+  // dropped the name from bridge-printed comandas).
+  if (L.cliente !== false && p.customer_name && p.kind !== "test") {
     for (const ln of wrap(`Cliente: ${p.customer_name}`, COLS)) esc.line(ln);
+  }
+  // Delivery contact for delivery orders. Phone stays on the customer copy
+  // (the cashier confirms it), but the address prints on the kitchen copies
+  // too so whoever hands the bag to the driver can see the destination.
+  if (p.order_type === "delivery" && p.kind !== "test") {
+    if (p.kind === "customer_ticket" && p.delivery_phone) {
+      for (const ln of wrap(`Tel: ${p.delivery_phone}`, COLS)) esc.line(ln);
+    }
+    if (L.delivery_address !== false && p.delivery_address) {
+      for (const ln of wrap(`Dir: ${p.delivery_address}`, COLS)) esc.line(ln);
+    }
   }
   if (L.hora !== false) {
     esc.line(`Hora: ${formatTime(p.created_at)}`);
