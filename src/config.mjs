@@ -65,7 +65,12 @@ export function loadConfig() {
 
   const common = {
     label: raw.label ?? `bridge@${os.hostname()}`,
-    pollIntervalMs: Number(raw.poll_interval_ms ?? 30_000),
+    // 5s poll = the printing latency CEILING. Field data showed realtime
+    // postgres_changes degrading to 15-30s (or dropping events outright)
+    // exactly during service hours, so the poll is the real latency
+    // guarantee and realtime is just the fast path. The query is a narrow
+    // indexed SELECT — negligible load even across a large fleet.
+    pollIntervalMs: Number(raw.poll_interval_ms ?? 5_000),
     maxAttempts: Number(raw.max_attempts ?? 3),
     // Escape hatch for routers that dislike even the slow scan:
     // { "disable_discovery": true } turns network discovery off entirely.
