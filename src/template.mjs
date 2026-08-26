@@ -485,5 +485,8 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
 
   esc.feed(settings.feed_before_cut ?? 3);
   esc.cut();
+  // After the cut so the sound announces a finished, tearable ticket.
+  // Kept in sync with src/lib/printing/templates/kitchen-ticket.ts.
+  if ((settings.beep ?? 0) > 0) esc.beep(settings.beep);
   return esc.build();
 }

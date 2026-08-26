@@ -118,6 +118,12 @@ export class EscPos {
     return this;
   }
   cut() { return this.push(GS, 0x56, 0x01); }
+  // ESC B n t — buzzer: n beeps of t×100ms (no-op on printers without one).
+  beep(times, duration = 3) {
+    const n = Math.max(1, Math.min(9, Math.round(times)));
+    const t = Math.max(1, Math.min(9, Math.round(duration)));
+    return this.push(ESC, 0x42, n, t);
+  }
   build() { return Buffer.from(this.bytes); }
 }
 
