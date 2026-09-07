@@ -72,9 +72,12 @@ export class EscPos {
     if (s.doubleWidth) n |= 0b0010_0000;
     if (s.underline) n |= 0b1000_0000;
     this.push(ESC, 0x21, n);
-    // ESC ! reselects font A/B (bit 0), so font C must be re-asserted with
-    // ESC M 2 after every style change (mirror of escpos.ts).
-    if (s.font === "C") this.push(ESC, 0x4d, 2);
+    // Font B is asserted with ESC M 1 after every style change — clone USB
+    // firmware often ignores ESC ! bit 0 and only switches fonts on ESC M —
+    // and font C is re-asserted with ESC M 2 (ESC ! would drop it). Font A
+    // emits ESC ! alone (byte-identical to before). Mirror of escpos.ts.
+    if (s.font === "B") this.push(ESC, 0x4d, 1);
+    else if (s.font === "C") this.push(ESC, 0x4d, 2);
     return this;
   }
   // ESC G n — double-strike (darker print). Unaffected by ESC ! n.
