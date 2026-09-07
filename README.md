@@ -28,6 +28,11 @@ and paste the command it shows into the restaurant PC:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://<app>/bridge/install.ps1))) -Code XXXX-XXXX -Url https://<app>"
 ```
 
+On Windows the installer also drops a **Print Bridge** shortcut on the
+Desktop: if someone closes the bridge window by accident, double-clicking it
+brings the bridge back (it refuses to start a second copy while one is
+running).
+
 ```bash
 # macOS / Linux
 curl -fsSL https://<app>/bridge/install.sh | sh -s -- --code XXXX-XXXX --url https://<app>
@@ -264,6 +269,7 @@ journalctl -u fujun-bridge -f   # follow logs
 | `realtime: CONNECTING` (never SUBSCRIBED) | No internet, wrong `supabase_url`, or wrong key. |
 | `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. |
 | Jobs queue but never print | Bridge isn't running, or printer is `is_active=false` in the DB. |
+| Windows: jobs queue for hours, then everything prints the moment you press **Enter** in the bridge window (`CHANNEL_ERROR` → `SUBSCRIBED`) | Someone clicked inside the console: QuickEdit "Select" mode blocks every console write, which freezes the whole process. 0.5.3+ turns QuickEdit off on its own console at start. On older builds: right-click the title bar → *Propiedades* → untick *Modo de edición rápida*, or `reg add HKCU\Console /v QuickEdit /t REG_DWORD /d 0 /f`. |
 | App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Downloads never auto-update: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
 | macOS: "cannot be opened because the developer cannot be verified" | `xattr -d com.apple.quarantine print-bridge-macos-arm64`, then run again. |
 

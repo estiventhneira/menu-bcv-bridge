@@ -22,6 +22,7 @@ import { loadConfig } from "./config.mjs";
 import { runPair } from "./pair.mjs";
 import { startDiscovery, isConnectionError } from "./discover.mjs";
 import { startSelfUpdate } from "./self-update.mjs";
+import { disableQuickEdit } from "./console-mode.mjs";
 import { VERSION } from "./version.mjs";
 import { renderKitchenTicket } from "./template.mjs";
 import { renderCajaReport } from "./caja-report.mjs";
@@ -34,6 +35,12 @@ if (argv[0] === "pair") {
   await runPair(argv.slice(1));
   process.exit(0);
 }
+
+// Windows: a stray click inside the console window puts conhost into
+// QuickEdit selection mode, and every console write blocks until someone
+// presses Enter — which froze a whole bridge for 10+ hours in the field
+// (see console-mode.mjs). Turn it off before the first log line.
+await disableQuickEdit({ log });
 
 const cfg = loadConfig();
 const supabase = createClient(
@@ -83,6 +90,23 @@ async function signInDevice() {
 // id -> { transport: 'wifi' | 'usb_bridge', name, host?, port?, os_printer_name? }
 const printers = new Map();
 const inFlight = new Set();
+// Per-printer promise chain — drive each printer one job at a time (mirror of
+// src/lib/printing/printer-serial.ts). Station splits put several rows per
+// order on one printer; a second TCP socket to a printer mid-ticket is
+// refused or interleaved by some firmwares, and the spooler path is cheap to
+// serialize. Different printers still run in parallel.
+const printerChains = new Map();
+function serialized(printerId, fn) {
+  const prev = printerChains.get(printerId) ?? Promise.resolve();
+  const result = prev.then(fn);
+  // The chain itself never rejects — a failed job must not block the next.
+  const tail = result.then(() => undefined, () => undefined);
+  printerChains.set(printerId, tail);
+  tail.then(() => {
+    if (printerChains.get(printerId) === tail) printerChains.delete(printerId);
+  });
+  return result;
+}
 // Discovery reporter (device mode only) — see discover.mjs.
 let discovery = null;
 
@@ -222,6 +246,16 @@ async function processJob(job) {
   if (!printer) return; // not our printer
   inFlight.add(job.id);
   try {
+    // The claim waits inside the chain, so a queued job stays 'pending'
+    // (never reaped as stuck) and a poll re-delivery hits the guard above.
+    await serialized(job.printer_id, () => runJob(job, printer));
+  } finally {
+    inFlight.delete(job.id);
+  }
+}
+
+async function runJob(job, printer) {
+  try {
     // Atomic claim: only proceed if we were the one to flip pending→in_progress.
     const { data: claimed, error: claimErr } = await supabase
       .from("print_jobs")
@@ -276,8 +310,6 @@ async function processJob(job) {
         claimed_at: null,
       })
       .eq("id", job.id);
-  } finally {
-    inFlight.delete(job.id);
   }
 }
 

@@ -109,6 +109,13 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
   const plain = () => {
     if (usesMagnify) esc.magnify(1, 1);
     esc.style({});
+    // Blank-line gaps (`feed`) after a block ride on the CURRENT ESC 3 feed,
+    // so after a headline (2x) at "pequeno" a gap fed 56 dots — nearly twice
+    // the body line and more than the normal-size layout it was meant to
+    // shrink. Restore the body feed so gaps are one body line tall. Only
+    // needed when headlines are taller than the body (pequeno); at grande/
+    // extra both share one height so the bytes stay unchanged.
+    if (sizeControlsSpacing && headH !== bodyH) esc.lineSpacing(lsFor(bodyH));
   };
 
   // ----- Logo (letterhead) -----
@@ -138,6 +145,15 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     } catch {
       // ignore — fall through to the text-only ticket
     }
+  }
+
+  // ----- Reprint banner (any kind) — mirror of kitchen-ticket.ts -----
+  if (L.reimpresion !== false && p.meta?.reprint) {
+    esc.align("center");
+    med({ bold: true });
+    esc.line("*** REIMPRESION ***");
+    plain();
+    esc.feed(1);
   }
 
   if (p.kind === "kitchen_modification") {
@@ -438,7 +454,15 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
 
     if (L.currency_table !== false && f.totals_by_currency && f.totals_by_currency.length > 0) {
       const order = ["USD", "VES", "COP"];
+      // Per-column toggles: a hidden currency drops out and the table
+      // re-flows to the remaining columns (colWidth below follows cells).
+      const hiddenByToggle = {
+        USD: L.currency_table_usd === false,
+        VES: L.currency_table_ves === false,
+        COP: L.currency_table_cop === false,
+      };
       const cells = order
+        .filter((cur) => !hiddenByToggle[cur])
         .map((cur) => f.totals_by_currency.find((t) => t.currency === cur))
         .filter(Boolean);
 

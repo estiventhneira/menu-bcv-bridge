@@ -69,6 +69,13 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
   const plain = () => {
     if (usesMagnify) esc.magnify(1, 1);
     esc.style({});
+    // Blank-line gaps (`feed`) after a block ride on the CURRENT ESC 3 feed,
+    // so after a headline (2x) at "pequeno" a gap fed 56 dots — nearly twice
+    // the body line and more than the normal-size layout it was meant to
+    // shrink. Restore the body feed so gaps are one body line tall. Only
+    // needed when headlines are taller than the body (pequeno); at grande/
+    // extra both share one height so the bytes stay unchanged.
+    if (sizeControlsSpacing && headH !== bodyH) esc.lineSpacing(lsFor(bodyH));
   };
 
   if (p.logo?.data) {
