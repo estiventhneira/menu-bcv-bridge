@@ -55,6 +55,27 @@ function resolveLineToggles(settings, kind) {
   return merged;
 }
 
+// Mirror of textSizeForBucket / resolveTextSize in print-settings.ts (0.5.6):
+// per-face size overrides; undefined = follow the shared `text_size`.
+function textSizeForBucket(settings, bucket) {
+  const over =
+    bucket === "caja" ? settings.text_size_caja : settings.text_size_comanda;
+  return over ?? settings.text_size ?? "normal";
+}
+
+function resolveTextSize(settings, kind) {
+  return textSizeForBucket(settings, bucketForKind(kind));
+}
+
+// Mirror of itemsTextSizeForBucket / resolveItemsTextSize: item lines may be
+// sized apart from the body; undefined = same as the face's text size.
+function resolveItemsTextSize(settings, kind) {
+  const bucket = bucketForKind(kind);
+  const over =
+    bucket === "caja" ? settings.items_text_size_caja : settings.items_text_size_comanda;
+  return over ?? textSizeForBucket(settings, bucket);
+}
+
 export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
   const COLS = Math.max(16, Math.round(cols) || DEFAULT_COLS);
   const COLS_BIG = Math.floor(COLS / 2);
@@ -69,16 +90,17 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
   if (settings.char_spacing && settings.char_spacing > 0) {
     esc.charSpacing(settings.char_spacing);
   }
-  const bodyH =
-    settings.text_size === "pequeno" ? 1
-    : settings.text_size === "grande" ? 3
-    : settings.text_size === "extra" ? 4
-    : 2;
+  const textSize = resolveTextSize(settings, p.kind);
+  const hFor = (size) =>
+    size === "pequeno" ? 1 : size === "grande" ? 3 : size === "extra" ? 4 : 2;
+  const bodyH = hFor(textSize);
   const headH = Math.max(2, bodyH);
-  const usesMagnify = bodyH > 2;
+  // Item lines can be sized apart from the body (mirror of kitchen-ticket.ts).
+  const itemH = hFor(resolveItemsTextSize(settings, p.kind));
+  const usesMagnify = Math.max(bodyH, itemH) > 2;
   // Line spacing follows the text height when size != normal (see
   // kitchen-ticket.ts); normal keeps the printer default.
-  const sizeControlsSpacing = bodyH !== 2;
+  const sizeControlsSpacing = bodyH !== 2 || itemH !== 2;
   const lsStep = settings.line_spacing || 0;
   // Negative steps tighten below the printer default; feeds floored at 12
   // dots so escpos never falls back to ESC 2 (mirror of kitchen-ticket.ts).
@@ -108,6 +130,7 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     }
   };
   const med = (b = {}) => scaled(1, bodyH, b);
+  const items = (b = {}) => scaled(1, itemH, b);
   const big = (b = {}) => scaled(2, headH, b);
   const plain = () => {
     if (usesMagnify) esc.magnify(1, 1);
@@ -117,8 +140,11 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     // the body line and more than the normal-size layout it was meant to
     // shrink. Restore the body feed so gaps are one body line tall. Only
     // needed when headlines are taller than the body (pequeno); at grande/
-    // extra both share one height so the bytes stay unchanged.
-    if (sizeControlsSpacing && headH !== bodyH) esc.lineSpacing(lsFor(bodyH));
+    // extra both share one height so the bytes stay unchanged. Same restore
+    // after an item block sized apart from the body.
+    if (sizeControlsSpacing && (headH !== bodyH || itemH !== bodyH)) {
+      esc.lineSpacing(lsFor(bodyH));
+    }
   };
 
   // ----- Logo (letterhead) -----
@@ -305,22 +331,22 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     // Price rides the name line when it fits; long names keep the historic
     // price-on-its-own-line fallback (mirror of kitchen-ticket.ts).
     const inline = money !== null && first.length + 1 + money.length <= COLS;
-    med({ bold: true });
+    items({ bold: true });
     if (inline) {
       esc.text(first);
-      med();
+      items();
       esc.line(" ".repeat(COLS - first.length - money.length) + money);
-      if (wrapped.length > 1) med({ bold: true });
+      if (wrapped.length > 1) items({ bold: true });
     } else {
       esc.line(first);
     }
     for (let i = 1; i < wrapped.length; i++) esc.line(" ".repeat(qty.length) + wrapped[i]);
     if (money !== null && !inline) {
-      med();
+      items();
       const pad = Math.max(1, COLS - money.length);
       esc.line(" ".repeat(pad) + money);
     }
-    med();
+    items();
     if (
       L.customizations !== false &&
       item.customizations &&

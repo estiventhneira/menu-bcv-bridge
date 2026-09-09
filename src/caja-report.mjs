@@ -29,10 +29,13 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
     esc.charSpacing(settings.char_spacing);
   }
 
+  // Caja-side paper follows the recibo face size (mirror of
+  // textSizeForBucket(settings, "caja") in print-settings.ts, 0.5.6).
+  const textSize = settings.text_size_caja ?? settings.text_size ?? "normal";
   const bodyH =
-    settings.text_size === "pequeno" ? 1
-    : settings.text_size === "grande" ? 3
-    : settings.text_size === "extra" ? 4
+    textSize === "pequeno" ? 1
+    : textSize === "grande" ? 3
+    : textSize === "extra" ? 4
     : 2;
   const headH = Math.max(2, bodyH);
   const usesMagnify = bodyH > 2;
