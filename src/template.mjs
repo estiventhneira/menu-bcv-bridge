@@ -100,8 +100,11 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
         doubleWidth: widthMul === 2,
       });
     } else {
-      esc.magnify(widthMul, heightMul);
+      // Style first, magnify LAST: ESC ! bits 4/5 and GS ! share one size
+      // register on Epson-spec printers (last received command wins), so a
+      // trailing ESC ! reset grande/extra to ×1 (mirror of kitchen-ticket.ts).
       esc.style(emphasis(b));
+      esc.magnify(widthMul, heightMul);
     }
   };
   const med = (b = {}) => scaled(1, bodyH, b);
@@ -198,6 +201,39 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
         esc.line(`ANTES: MESA ${p.previous_table_label}`);
       }
     }
+    plain();
+    esc.feed(1);
+  }
+
+  // ----- Factura fiscal (232, mirror of kitchen-ticket.ts) -----
+  if (p.kind === "customer_ticket" && L.factura !== false && p.fiscal) {
+    const f = p.fiscal;
+    esc.align("center");
+    med({ bold: true });
+    esc.line(
+      f.kind === "maquina_fiscal"
+        ? `FACTURA FISCAL N° ${f.number}`
+        : `FACTURA${f.serie ? ` Serie ${f.serie}` : ""} N° ${f.number}`,
+    );
+    plain();
+    med();
+    if (f.kind === "maquina_fiscal") {
+      if (f.machine_registration_number) {
+        esc.line(`Máq. fiscal ${f.machine_registration_number}`);
+      }
+    } else if (f.control_number) {
+      esc.line(`N° de Control ${f.control_number}`);
+    }
+    esc.align("left");
+    const issuer = [f.issuer_tax_id ? `RIF ${f.issuer_tax_id}` : null, f.issuer_legal_name]
+      .filter(Boolean)
+      .join(" · ");
+    if (issuer) for (const ln of wrap(issuer, COLS)) esc.line(ln);
+    if (f.issuer_address) for (const ln of wrap(f.issuer_address, COLS)) esc.line(ln);
+    const customer = [f.customer_name, f.customer_tax_id ? `RIF/CI ${f.customer_tax_id}` : null]
+      .filter(Boolean)
+      .join(" · ");
+    if (customer) for (const ln of wrap(`Cliente: ${customer}`, COLS)) esc.line(ln);
     plain();
     esc.feed(1);
   }

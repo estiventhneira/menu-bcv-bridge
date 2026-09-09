@@ -60,8 +60,10 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
         doubleWidth: widthMul === 2,
       });
     } else {
-      esc.magnify(widthMul, heightMul);
+      // Style first, magnify LAST — ESC ! bits 4/5 and GS ! share one size
+      // register (last received command wins); mirror of caja-report.ts.
       esc.style(emphasis(b));
+      esc.magnify(widthMul, heightMul);
     }
   };
   const med = (b = {}) => scaled(1, bodyH, b);

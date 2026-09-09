@@ -19,6 +19,9 @@ const PC858_MAP = (() => {
     ["á", 0xa0], ["í", 0xa1], ["ó", 0xa2], ["ú", 0xa3], ["ñ", 0xa4],
     ["Ñ", 0xa5], ["ª", 0xa6], ["º", 0xa7], ["¿", 0xa8], ["¡", 0xad],
     ["«", 0xae], ["»", 0xaf], ["€", 0xd5], ["·", 0xfa],
+    // Degree sign (synced from escpos.ts): the factura block (232) prints
+    // "N° 000123" / "N° de Control" — without it bridge receipts read "N?".
+    ["°", 0xf8],
     // Uppercase accented vowels (synced from escpos.ts): station names go
     // through .toUpperCase() on split comandas (158), and "CAFÉ"/"MARISCOS
     // FRÍOS" must render on bridge printers too, not as "?".
