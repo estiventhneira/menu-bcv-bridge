@@ -5,6 +5,10 @@
 import { EscPos, wrap } from "./escpos.mjs";
 
 const DEFAULT_COLS = 48;
+// Mirror of FEED_CUT_LINE_DOTS in src/lib/printing/print-settings.ts — the line
+// spacing pinned before the pre-cut feed so `feed_before_cut` means the same
+// physical distance at every text size.
+const FEED_CUT_LINE_DOTS = 34;
 
 function formatTime(iso) {
   try {
@@ -182,6 +186,13 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
   for (const ln of wrap(p.restaurant_name, COLS)) esc.line(ln);
   plain();
 
+  // Pin the line spacing before the tail so `feed_before_cut` is a constant
+  // physical distance (0.5.7). Left to ride on the body spacing it scaled with
+  // `text_size` — 28 mm at "pequeno" vs 70 mm at "grande" for the same "6" —
+  // so a printer whose head-to-cutter gap needed ~30 mm clipped its footer at
+  // the maximum setting on a small-text ticket. Mirror of the app renderer;
+  // bridges on 0.5.6 and older still scale the tail with the text size.
+  esc.lineSpacing(FEED_CUT_LINE_DOTS);
   esc.feed(settings.feed_before_cut ?? 3);
   esc.cut();
   return esc.build();
