@@ -1,5 +1,12 @@
 // Mirror of src/lib/printing/escpos.ts, ported to ESM/JS.
 // Kept in sync manually — both files implement the same byte sequence.
+//
+// Raster text mode (`new EscPos({ rasterText: { font, cols } })`): text is
+// composed from a glyph atlas and sent as GS v 0 images; style/size/spacing
+// calls become state for the engine in ./raster-text.mjs (the SAME file the
+// app imports, so both runtimes print identical bytes).
+
+import { RasterTextEngine, RASTER_CELL_W } from "./raster-text.mjs";
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -60,14 +67,32 @@ function encodeText(text) {
 }
 
 export class EscPos {
-  constructor() { this.bytes = []; this.init(); }
+  constructor(opts = {}) {
+    this.bytes = [];
+    // Raster text engine — null in the historic text mode.
+    this.rt = opts.rasterText
+      ? new RasterTextEngine(opts.rasterText.font, { lineDots: opts.rasterText.cols * RASTER_CELL_W })
+      : null;
+    this.init();
+    // Rasters print from the left margin (alignment is composed in); pin
+    // ESC a 0 once for clones that keep alignment across ESC @.
+    if (this.rt) this.push(ESC, 0x61, 0);
+  }
   push(...b) { for (const x of b) this.bytes.push(x & 0xff); return this; }
+  // Loop, never spread: a raster line block is several KB.
+  pushAll(b) { for (let i = 0; i < b.length; i++) this.bytes.push(b[i] & 0xff); return this; }
+  flushRaster() { if (this.rt) this.pushAll(this.rt.flushPending()); }
   init() { this.push(ESC, 0x40); this.push(ESC, 0x74, CODEPAGE_PC858); return this; }
   align(a) {
+    if (this.rt) { this.rt.align(a); return this; }
     const n = a === "center" ? 1 : a === "right" ? 2 : 0;
     return this.push(ESC, 0x61, n);
   }
   style(s = {}) {
+    if (this.rt) {
+      this.rt.style({ bold: s.bold, doubleWidth: s.doubleWidth, doubleHeight: s.doubleHeight });
+      return this;
+    }
     let n = 0;
     if (s.font === "B") n |= 0b0000_0001;
     if (s.bold) n |= 0b0000_1000;
@@ -84,25 +109,42 @@ export class EscPos {
     return this;
   }
   // ESC G n — double-strike (darker print). Unaffected by ESC ! n.
-  doubleStrike(on) { return this.push(ESC, 0x47, on ? 1 : 0); }
+  doubleStrike(on) {
+    if (this.rt) return this;
+    return this.push(ESC, 0x47, on ? 1 : 0);
+  }
   // ESC SP n — right-side character spacing in dots (0..255).
   charSpacing(dots) {
+    if (this.rt) { this.rt.charSpacing(dots); return this; }
     return this.push(ESC, 0x20, Math.max(0, Math.min(255, Math.round(dots))));
   }
   // ESC 3 n / ESC 2 — line spacing (n/180") or font default.
   lineSpacing(dots) {
+    if (this.rt) { this.rt.lineSpacing(dots); return this; }
     if (dots > 0) return this.push(ESC, 0x33, Math.min(255, Math.round(dots)));
     return this.push(ESC, 0x32);
   }
   // GS ! n — character magnification, w/h in 1..8 (high/low nibble).
   magnify(w, h) {
+    if (this.rt) { this.rt.magnify(w, h); return this; }
     const cw = Math.max(1, Math.min(8, Math.round(w)));
     const ch = Math.max(1, Math.min(8, Math.round(h)));
     return this.push(GS, 0x21, ((cw - 1) << 4) | (ch - 1));
   }
-  text(s) { return this.push(...encodeText(s)); }
-  line(s = "") { if (s) this.text(s); return this.push(LF); }
-  feed(n = 1) { for (let i = 0; i < n; i++) this.push(LF); return this; }
+  text(s) {
+    if (this.rt) return this.pushAll(this.rt.text(s));
+    return this.push(...encodeText(s));
+  }
+  line(s = "") {
+    if (this.rt) return this.pushAll(this.rt.line(s));
+    if (s) this.text(s);
+    return this.push(LF);
+  }
+  feed(n = 1) {
+    if (this.rt) return this.pushAll(this.rt.feed(n));
+    for (let i = 0; i < n; i++) this.push(LF);
+    return this;
+  }
   rule(chars, ch = "-") { return this.line(ch.repeat(chars)); }
   // Two-column line: label flush-left, value flush-right, padded to `width`.
   twoCol(label, value, width) {
@@ -115,6 +157,7 @@ export class EscPos {
   // GS v 0 — raster bit image (1-bit rows, MSB first, 1 = black dot).
   // Loop (not spread): data can be several KB.
   raster(data, widthBytes, height) {
+    this.flushRaster();
     this.push(
       GS, 0x76, 0x30, 0x00,
       widthBytes & 0xff, (widthBytes >> 8) & 0xff,
@@ -123,14 +166,15 @@ export class EscPos {
     for (let i = 0; i < data.length; i++) this.bytes.push(data[i] & 0xff);
     return this;
   }
-  cut() { return this.push(GS, 0x56, 0x01); }
+  cut() { this.flushRaster(); return this.push(GS, 0x56, 0x01); }
   // ESC B n t — buzzer: n beeps of t×100ms (no-op on printers without one).
   beep(times, duration = 3) {
+    this.flushRaster();
     const n = Math.max(1, Math.min(9, Math.round(times)));
     const t = Math.max(1, Math.min(9, Math.round(duration)));
     return this.push(ESC, 0x42, n, t);
   }
-  build() { return Buffer.from(this.bytes); }
+  build() { this.flushRaster(); return Buffer.from(this.bytes); }
 }
 
 export function wrap(text, width) {

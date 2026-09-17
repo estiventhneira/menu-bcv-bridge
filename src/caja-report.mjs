@@ -3,8 +3,18 @@
 // test in src/lib/printing/templates/caja-report.test.ts.
 
 import { EscPos, wrap } from "./escpos.mjs";
+import { RASTER_CELL_W } from "./raster-text.mjs";
 
 const DEFAULT_COLS = 48;
+
+// Mirror of rasterFontOf in src/lib/printing/print-settings.ts (see template.mjs).
+const RASTER_FONTS = ["jetbrains-mono"];
+function rasterFontOf(settings) {
+  const f = settings.font;
+  if (typeof f !== "string" || !f.startsWith("raster:")) return null;
+  const name = f.slice("raster:".length);
+  return RASTER_FONTS.includes(name) ? name : null;
+}
 // Mirror of FEED_CUT_LINE_DOTS in src/lib/printing/print-settings.ts — the line
 // spacing pinned before the pre-cut feed so `feed_before_cut` means the same
 // physical distance at every text size.
@@ -23,10 +33,18 @@ function formatTime(iso) {
   }
 }
 
-export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
-  const COLS = Math.max(16, Math.round(cols) || DEFAULT_COLS);
+export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}, opts = {}) {
+  const rawCols = Math.max(16, Math.round(cols) || DEFAULT_COLS);
+  // Raster text selection + paper clamp — mirror of caja-report.ts.
+  const rasterName = rasterFontOf(settings);
+  const rasterFont =
+    rasterName && opts.rasterFont && opts.rasterFont.name === rasterName ? opts.rasterFont : null;
+  const COLS =
+    rasterFont && opts.paperDots
+      ? Math.max(16, Math.min(rawCols, Math.floor(opts.paperDots / RASTER_CELL_W)))
+      : rawCols;
   const COLS_BIG = Math.floor(COLS / 2);
-  const esc = new EscPos();
+  const esc = new EscPos(rasterFont ? { rasterText: { font: rasterFont, cols: COLS } } : {});
 
   if (settings.font === "intensa") esc.doubleStrike(true);
   if (settings.char_spacing && settings.char_spacing > 0) {
@@ -125,7 +143,7 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}) {
   esc.align("left");
   med();
   if (p.caja_number) esc.twoCol("Caja", `#${p.caja_number}`, COLS);
-  esc.line(`Abrió: ${formatTime(p.opened_at)}`);
+  esc.line(`${p.opened_label || "Abrió"}: ${formatTime(p.opened_at)}`);
   if (p.opened_by) for (const ln of wrap(`  por ${p.opened_by}`, COLS)) esc.line(ln);
   if (p.closed_at) {
     esc.line(`Cerró: ${formatTime(p.closed_at)}`);

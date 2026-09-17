@@ -26,6 +26,8 @@ import { disableQuickEdit } from "./console-mode.mjs";
 import { VERSION } from "./version.mjs";
 import { renderKitchenTicket } from "./template.mjs";
 import { renderCajaReport } from "./caja-report.mjs";
+import { paperDotsForWidth } from "./raster-text.mjs";
+import { JETBRAINS_MONO } from "./fonts/jetbrains-mono.atlas.mjs";
 import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import crypto from "node:crypto";
@@ -117,7 +119,7 @@ function log(...args) {
 async function reloadPrinters() {
   const { data, error } = await supabase
     .from("printers")
-    .select("id, name, transport, connection, is_active, chars_per_line, print_settings, claimed_by_device_id")
+    .select("id, name, transport, connection, is_active, chars_per_line, paper_width_mm, print_settings, claimed_by_device_id")
     .in("restaurant_id", cfg.restaurantIds)
     .in("transport", ["wifi", "usb_bridge"])
     .eq("is_active", true);
@@ -134,6 +136,8 @@ async function reloadPrinters() {
     // Per-printer formatting + line toggles (bold, spacing, size, visible
     // lines). Threaded alongside chars_per_line into the renderer.
     const printSettings = p.print_settings ?? {};
+    // Head width in dots — raster-font tickets clamp their columns to it.
+    const paperDots = paperDotsForWidth(p.paper_width_mm);
     if (p.transport === "wifi") {
       if (!c.host) continue;
       printers.set(p.id, {
@@ -142,6 +146,7 @@ async function reloadPrinters() {
         host: c.host,
         port: Number(c.port) || 9100,
         chars_per_line: charsPerLine,
+        paper_dots: paperDots,
         print_settings: printSettings,
         claimed_by: p.claimed_by_device_id ?? null,
       });
@@ -152,6 +157,7 @@ async function reloadPrinters() {
         name: p.name,
         os_printer_name: c.os_printer_name,
         chars_per_line: charsPerLine,
+        paper_dots: paperDots,
         print_settings: printSettings,
         claimed_by: p.claimed_by_device_id ?? null,
       });
@@ -271,9 +277,15 @@ async function runJob(job, printer) {
     }
 
     log(`printing job ${job.id} → ${printer.name} (${printer.transport})`);
-    const bytes = job.kind === "caja_report"
-      ? renderCajaReport(job.payload, printer.chars_per_line, printer.print_settings)
-      : renderKitchenTicket(job.payload, printer.chars_per_line, printer.print_settings);
+    // caja_movement (240) = retiro/ingreso voucher — same section renderer as
+    // the cierre report, so one branch covers both.
+    // Raster font (print_settings.font = "raster:jetbrains-mono"): the
+    // renderer only uses the atlas when the settings name it, so passing it
+    // unconditionally is safe — ROM-font printers stay byte-identical.
+    const renderOpts = { rasterFont: JETBRAINS_MONO, paperDots: printer.paper_dots };
+    const bytes = job.kind === "caja_report" || job.kind === "caja_movement"
+      ? renderCajaReport(job.payload, printer.chars_per_line, printer.print_settings, renderOpts)
+      : renderKitchenTicket(job.payload, printer.chars_per_line, printer.print_settings, renderOpts);
     if (printer.transport === "wifi") {
       await sendOverTcp(printer.host, printer.port, bytes);
     } else if (printer.transport === "usb_bridge") {
@@ -336,7 +348,7 @@ async function drainPending() {
 // here: those are our own echoes coming back through realtime, and reacting
 // to them is what fed the reload/claim write loop.
 const PRINTER_CONFIG_COLS = [
-  "name", "transport", "connection", "is_active", "chars_per_line", "print_settings",
+  "name", "transport", "connection", "is_active", "chars_per_line", "paper_width_mm", "print_settings",
 ];
 
 function printerEventMatters(payload) {

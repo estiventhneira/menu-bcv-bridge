@@ -306,7 +306,30 @@ Then configure a WiFi printer in the app with `host=127.0.0.1 port=9100`,
 run the bridge, and trigger a print from the app. The simulator decodes
 the bytes and dumps them to stdout.
 
+Without a printer or the app at all, render a sample straight through this
+bridge's templates (add `--png` to see the paper as an image):
+
+```bash
+node ../scripts/print-simulate.mjs --sample --recibo
+node ../scripts/print-simulate.mjs --sample --settings '{"font":"raster:jetbrains-mono"}' --png ../tmp/recibo.png
+```
+
 ---
+
+## Raster font (0.6.0)
+
+A printer whose `print_settings.font` is `raster:jetbrains-mono` gets its
+text rendered by the bridge into 1-bit images (`GS v 0`, the same command the
+receipt logo uses) instead of code-page text, so every printer prints the
+same typeface (JetBrains Mono) regardless of its ROM font or firmware quirks.
+The glyph atlas is `src/fonts/jetbrains-mono.atlas.mjs`, generated from the
+OFL-licensed TTFs by `scripts/print-font-atlas/build.mjs` in the app repo;
+the composer is `src/raster-text.mjs` — the same file the app's WebUSB path
+imports, so both print identical bytes.
+
+Raster tickets are 30–50× larger than text tickets (tens of KB). TCP sends
+above 16 KB wait up to 4 s before closing the socket so slow Wi-Fi modules
+drain their buffer. Bridges older than 0.6.0 print such printers in Font A.
 
 ## Self-update (0.5.0)
 

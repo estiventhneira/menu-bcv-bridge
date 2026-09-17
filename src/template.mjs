@@ -2,8 +2,20 @@
 // Both files render identical bytes for the same payload.
 
 import { EscPos, wrap } from "./escpos.mjs";
+import { RASTER_CELL_W } from "./raster-text.mjs";
 
 const DEFAULT_COLS = 48;
+
+// Mirror of RASTER_FONTS / rasterFontOf in src/lib/printing/print-settings.ts:
+// `font: "raster:<name>"` selects a glyph atlas (text printed as GS v 0
+// images); unknown names fall back to the ROM font like any other value.
+const RASTER_FONTS = ["jetbrains-mono"];
+function rasterFontOf(settings) {
+  const f = settings.font;
+  if (typeof f !== "string" || !f.startsWith("raster:")) return null;
+  const name = f.slice("raster:".length);
+  return RASTER_FONTS.includes(name) ? name : null;
+}
 // Mirror of FEED_CUT_LINE_DOTS in src/lib/printing/print-settings.ts — the line
 // spacing pinned before the pre-cut feed so `feed_before_cut` means the same
 // physical distance at every text size.
@@ -80,10 +92,19 @@ function resolveItemsTextSize(settings, kind) {
   return over ?? textSizeForBucket(settings, bucket);
 }
 
-export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
-  const COLS = Math.max(16, Math.round(cols) || DEFAULT_COLS);
+export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts = {}) {
+  const rawCols = Math.max(16, Math.round(cols) || DEFAULT_COLS);
+  // Raster text: only with the atlas the settings name, and never wider than
+  // the head (mirror of kitchen-ticket.ts).
+  const rasterName = rasterFontOf(settings);
+  const rasterFont =
+    rasterName && opts.rasterFont && opts.rasterFont.name === rasterName ? opts.rasterFont : null;
+  const COLS =
+    rasterFont && opts.paperDots
+      ? Math.max(16, Math.min(rawCols, Math.floor(opts.paperDots / RASTER_CELL_W)))
+      : rawCols;
   const COLS_BIG = Math.floor(COLS / 2);
-  const esc = new EscPos();
+  const esc = new EscPos(rasterFont ? { rasterText: { font: rasterFont, cols: COLS } } : {});
   const L = resolveLineToggles(settings, p.kind);
   const usdSymbol = settings.usd_symbol ?? "$";
 
@@ -185,6 +206,15 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}) {
     esc.align("center");
     med({ bold: true });
     esc.line("*** REIMPRESION ***");
+    plain();
+    esc.feed(1);
+  }
+
+  // ----- Cierre banner (paid recibo) — mirror of kitchen-ticket.ts -----
+  if (L.cierre !== false && p.kind === "customer_ticket" && p.meta?.settled) {
+    esc.align("center");
+    med({ bold: true });
+    esc.line("*** CIERRE ***");
     plain();
     esc.feed(1);
   }
