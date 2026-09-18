@@ -3,7 +3,7 @@
 // test in src/lib/printing/templates/caja-report.test.ts.
 
 import { EscPos, wrap } from "./escpos.mjs";
-import { RASTER_CELL_W } from "./raster-text.mjs";
+import { rasterColsFor } from "./raster-text.mjs";
 
 const DEFAULT_COLS = 48;
 
@@ -39,12 +39,19 @@ export function renderCajaReport(p, cols = DEFAULT_COLS, settings = {}, opts = {
   const rasterName = rasterFontOf(settings);
   const rasterFont =
     rasterName && opts.rasterFont && opts.rasterFont.name === rasterName ? opts.rasterFont : null;
+  // Letter spacing widens every cell, so the budget is the CELL PITCH, not a
+  // bare 12 dots: at `char_spacing` 2 a 48-column line needs 672 dots on a
+  // 576-dot head and the tail was thrown away (the COP column of TOTAL EN
+  // MONEDAS first). Spacing 0 ⇒ `paperDots / 12`, exactly as before.
+  const charSpacing = settings.char_spacing ?? 0;
   const COLS =
     rasterFont && opts.paperDots
-      ? Math.max(16, Math.min(rawCols, Math.floor(opts.paperDots / RASTER_CELL_W)))
+      ? Math.max(16, Math.min(rawCols, rasterColsFor(opts.paperDots, charSpacing)))
       : rawCols;
   const COLS_BIG = Math.floor(COLS / 2);
-  const esc = new EscPos(rasterFont ? { rasterText: { font: rasterFont, cols: COLS } } : {});
+  const esc = new EscPos(
+    rasterFont ? { rasterText: { font: rasterFont, cols: COLS, charSpacing } } : {},
+  );
 
   if (settings.font === "intensa") esc.doubleStrike(true);
   if (settings.char_spacing && settings.char_spacing > 0) {

@@ -21,7 +21,8 @@
 const ESC = 0x1b;
 const GS = 0x1d;
 
-/** Dots per column at ×1 — `cols × RASTER_CELL_W` is the line width. */
+/** Ink dots of one column at ×1. The line width is `cols × the CELL PITCH`,
+ *  which is this plus the printer's letter spacing — see `rasterCellPitch`. */
 export const RASTER_CELL_W = 12;
 /** Paper advance for a blank line when no `ESC 3` spacing is set: the
  *  printer's own 1/6" default (≈34 dots at 203 dpi), i.e. what an LF feeds. */
@@ -30,6 +31,22 @@ export const RASTER_DEFAULT_PITCH = 34;
  *  own explicit spacing is `24·h + 8`, so a raster "normal" line advances the
  *  same 56 dots their sized lines do. */
 export const RASTER_LINE_LEADING = 8;
+
+/**
+ * Dots one ×1 column advances: the 12-dot cell plus the `ESC SP n` letter
+ * spacing that follows it. The ROM path leaned on the printer to reflow a
+ * line that no longer fit at a wider pitch; a raster block has no such
+ * fallback, so the renderers must budget their columns at THIS width.
+ * Clamped exactly like `RasterTextEngine.charSpacing`.
+ */
+export function rasterCellPitch(charSpacing) {
+  return RASTER_CELL_W + Math.max(0, Math.min(255, Math.round(charSpacing) || 0));
+}
+
+/** Columns of raster text that fit a head of `paperDots` at this spacing. */
+export function rasterColsFor(paperDots, charSpacing) {
+  return Math.floor(Math.max(0, paperDots) / rasterCellPitch(charSpacing));
+}
 
 /**
  * Same table as escpos.ts: characters the atlas lacks fall back to ASCII
@@ -184,6 +201,57 @@ export function composeLine(font, segments, opts) {
 }
 
 /**
+ * Split one line's segments into the rows the paper actually fits.
+ *
+ * This is the raster stand-in for something the ROM path got for free: when a
+ * text line overran the head, the printer's own buffer filled, it printed what
+ * it had and continued on the next line, so nothing was ever lost. A raster
+ * block has no buffer-full rule — `composeLine` simply stops drawing at
+ * `lineDots` — which silently ate the right-hand end of every overlong line
+ * (the COP column of TOTAL EN MONEDAS, right-aligned amounts, long ESTACIÓN
+ * headers). Wrapping here restores the ROM behaviour, hard break included.
+ *
+ * Whitespace that would overflow is dropped instead of wrapped: a blank has
+ * no ink, and carrying it over would emit an all-blank continuation row.
+ *
+ * A line that already fits comes back as ONE row holding the same segments,
+ * so its composed bytes are unchanged.
+ */
+function splitToFit(font, segments, lineDots, charSpacing) {
+  const spacing = Math.max(0, Math.min(255, Math.round(charSpacing) || 0));
+  const rows = [];
+  let row = [];
+  let x = 0;
+  for (const seg of segments) {
+    const wMul = Math.max(1, Math.round(seg.wMul) || 1);
+    const hMul = Math.max(1, Math.round(seg.hMul) || 1);
+    const ink = font.cellW * wMul;
+    let buf = [];
+    for (const ch of normalizeRasterText(font, seg.text ?? "")) {
+      if (x + ink > lineDots) {
+        // A blank past the edge prints nothing — drop it rather than open a
+        // row with it. Anything else starts the continuation row, unless the
+        // row is still empty (one glyph wider than the paper: let composeLine
+        // clip it, or this would never terminate).
+        if (ch === " ") continue;
+        if (row.length > 0 || buf.length > 0) {
+          if (buf.length > 0) row.push({ ...seg, wMul, hMul, text: buf.join("") });
+          buf = [];
+          rows.push(row);
+          row = [];
+          x = 0;
+        }
+      }
+      buf.push(ch);
+      x += ink + spacing;
+    }
+    if (buf.length > 0) row.push({ ...seg, wMul, hMul, text: buf.join("") });
+  }
+  if (row.length > 0) rows.push(row);
+  return rows;
+}
+
+/**
  * Stateful line writer the encoders delegate to in raster mode. Every method
  * that would emit a text-mode command instead updates state; the byte-emitting
  * methods (`text`/`line`/`feed`/`flush`) return plain number arrays the
@@ -261,12 +329,23 @@ export class RasterTextEngine {
    *  line is a blank line (LF). */
   flush() {
     if (this.segments.length === 0) return this.blankAdvance();
-    const composed = composeLine(this.font, this.segments, {
+    // Wider than the paper ⇒ several blocks, like the ROM path's buffer-full
+    // wrap. A line that fits yields exactly one row, byte-for-byte as before.
+    const rows = splitToFit(this.font, this.segments, this.lineDots, this.spacing);
+    this.segments = [];
+    const out = [];
+    for (const row of rows) pushAll(out, this.emitRow(row));
+    return out.length > 0 ? out : this.blankAdvance();
+  }
+
+  /** One composed block plus the paper advance that completes its line. */
+  emitRow(segments) {
+    const composed = composeLine(this.font, segments, {
       lineDots: this.lineDots,
       align: this.alignMode,
       charSpacing: this.spacing,
     });
-    this.segments = [];
+    if (!composed) return this.blankAdvance();
     const H = composed.height;
     // Explicit spacing wins but can never overlap (a raster block always
     // advances its own height); default = glyph height + leading.

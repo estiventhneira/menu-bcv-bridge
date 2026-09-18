@@ -6,7 +6,7 @@
 // calls become state for the engine in ./raster-text.mjs (the SAME file the
 // app imports, so both runtimes print identical bytes).
 
-import { RasterTextEngine, RASTER_CELL_W } from "./raster-text.mjs";
+import { RasterTextEngine, rasterCellPitch } from "./raster-text.mjs";
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -70,8 +70,12 @@ export class EscPos {
   constructor(opts = {}) {
     this.bytes = [];
     // Raster text engine — null in the historic text mode.
+    // `charSpacing` widens every column, so the line budget is the CELL PITCH
+    // (12 + spacing), not a bare 12 — mirror of src/lib/printing/escpos.ts.
     this.rt = opts.rasterText
-      ? new RasterTextEngine(opts.rasterText.font, { lineDots: opts.rasterText.cols * RASTER_CELL_W })
+      ? new RasterTextEngine(opts.rasterText.font, {
+          lineDots: opts.rasterText.cols * rasterCellPitch(opts.rasterText.charSpacing ?? 0),
+        })
       : null;
     this.init();
     // Rasters print from the left margin (alignment is composed in); pin

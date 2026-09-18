@@ -34,6 +34,12 @@ export const RASTER_CELL_W: number;
 export const RASTER_DEFAULT_PITCH: number;
 export const RASTER_LINE_LEADING: number;
 
+export function rasterCellPitch(charSpacing: number | null | undefined): number;
+export function rasterColsFor(
+  paperDots: number,
+  charSpacing: number | null | undefined,
+): number;
+
 export function normalizeRasterText(font: RasterFont, s: string): string[];
 export function paperDotsForWidth(paperWidthMm: number | null | undefined): number;
 export function composeLine(
@@ -53,6 +59,7 @@ export class RasterTextEngine {
   line(s?: string): number[];
   feed(n?: number): number[];
   flush(): number[];
+  emitRow(segments: RasterSegment[]): number[];
   flushPending(): number[];
   blankAdvance(): number[];
   advanceBytes(dots: number): number[];

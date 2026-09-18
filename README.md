@@ -331,6 +331,16 @@ Raster tickets are 30–50× larger than text tickets (tens of KB). TCP sends
 above 16 KB wait up to 4 s before closing the socket so slow Wi-Fi modules
 drain their buffer. Bridges older than 0.6.0 print such printers in Font A.
 
+**0.6.1 — overflow no longer disappears.** A ROM-font line wider than the head
+was reflowed by the printer itself; a raster block has no such rule, so 0.6.0
+drew what fit and threw the rest away. Two fixes, both in `raster-text.mjs`:
+the column budget is now the cell PITCH (12 dots **plus** `char_spacing`, which
+used to push every full-width line off the paper), and a line still too wide
+wraps onto a continuation block instead of being cut. Symptoms on 0.6.0: the
+rightmost column of TOTAL EN MONEDAS (COP on a three-currency ticket) losing
+digits, right-aligned amounts truncated on the recibo and the cierre, and long
+`ESTACIÓN:` headers cut short on comandas. Update to 0.6.1 to fix them.
+
 ## Self-update (0.5.0)
 
 The bridge keeps itself current: ~90s after start and every ~6 hours
