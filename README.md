@@ -328,8 +328,21 @@ the composer is `src/raster-text.mjs` — the same file the app's WebUSB path
 imports, so both print identical bytes.
 
 Raster tickets are 30–50× larger than text tickets (tens of KB). TCP sends
-above 16 KB wait up to 4 s before closing the socket so slow Wi-Fi modules
-drain their buffer. Bridges older than 0.6.0 print such printers in Font A.
+above 4 KB hold the socket open after the last byte (about 1 s per 6 KB, up
+to 20 s, or until the printer closes first) so the Wi-Fi module can forward
+everything to the printer before it sees the close — some modules discard
+what they have not forwarded yet. Bridges older than 0.6.0 print such
+printers in Font A.
+
+**0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
+only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
+printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded
+the header and the rule when the bridge closed, and dropped the item lines:
+the ticket came out as `ORDEN # / MESA / Mesero / Hora / ------` and then
+nothing. The hold now assumes 6 bytes/ms, and the send has its own timeout
+(≥ 30 s) separate from the 10 s connect timeout, so a slow module can apply
+back-pressure for the whole drain without the socket being reset mid-job.
+Update every bridge that drives a raster-font printer to 0.6.2.
 
 **0.6.1 — overflow no longer disappears.** A ROM-font line wider than the head
 was reflowed by the printer itself; a raster block has no such rule, so 0.6.0
