@@ -334,6 +334,20 @@ everything to the printer before it sees the close — some modules discard
 what they have not forwarded yet. Bridges older than 0.6.0 print such
 printers in Font A.
 
+**0.6.3 — "CAMBIO DE TIPO" notices.** Staff can now change an order's type
+(Mesa ⇄ Para llevar ⇄ Delivery). The kitchen notice for that change rides on
+the existing `table_changed` modification plus a new `previous_order_type`
+field, and 0.6.3 prints it as `CAMBIO DE TIPO` / new header / `ANTES:
+DELIVERY` (the header prints even when the layout hides the order type).
+Older bridges print the same job as `CAMBIO DE MESA` with the new header — a
+safe degraded read, never `AGREGADO` (which would make the kitchen cook the
+dishes again).
+
+0.6.3 also honors the new `otras_estaciones` line toggle, which hides the
+`+ N artículos en otras estaciones` hint on station-split comandas and keeps
+the `ESTACIÓN: X` header. Older bridges ignore the toggle and still print the
+hint.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded

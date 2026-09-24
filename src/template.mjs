@@ -28,6 +28,17 @@ function formatHeader(p) {
   return "MESA -";
 }
 
+// A `table_changed` notice that is really an order-type change (252) —
+// mirror of isTypeChangeNotice in kitchen-ticket.ts.
+function isTypeChangeNotice(p) {
+  return (
+    p.kind === "kitchen_modification" &&
+    p.modification_type === "table_changed" &&
+    !!p.previous_order_type &&
+    p.previous_order_type !== p.order_type
+  );
+}
+
 function formatTime(iso) {
   try {
     const d = new Date(iso);
@@ -226,15 +237,18 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
     esc.feed(1);
   }
 
+  const typeChange = isTypeChangeNotice(p);
   if (p.kind === "kitchen_modification") {
     esc.align("center");
     big({ bold: true });
     esc.line(
       p.modification_type === "cancelled"
         ? "ANULADO"
-        : p.modification_type === "table_changed"
-          ? "CAMBIO DE MESA"
-          : "AGREGADO",
+        : typeChange
+          ? "CAMBIO DE TIPO"
+          : p.modification_type === "table_changed"
+            ? "CAMBIO DE MESA"
+            : "AGREGADO",
     );
     plain();
     esc.feed(1);
@@ -254,14 +268,24 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   }
 
   const showOrdenNumero = L.orden_numero !== false;
-  const showTipoOrden = L.tipo_orden !== false;
+  // A type-change notice IS its header: print it even when the layout hides
+  // the order type (mirror of kitchen-ticket.ts).
+  const showTipoOrden = L.tipo_orden !== false || typeChange;
   if (showOrdenNumero || showTipoOrden) {
     esc.align("center");
     big({ bold: true });
     if (showOrdenNumero) esc.line(`ORDEN #${p.order_number}`);
     if (showTipoOrden) {
       esc.line(formatHeader(p));
-      if (p.modification_type === "table_changed" && p.previous_table_label) {
+      if (typeChange) {
+        med({ bold: true });
+        esc.line(
+          `ANTES: ${formatHeader({
+            order_type: p.previous_order_type,
+            table_label: p.previous_table_label,
+          })}`,
+        );
+      } else if (p.modification_type === "table_changed" && p.previous_table_label) {
         // The big header already shows the NEW table; cooks also need the old
         // one to know which pending dishes this refers to.
         med({ bold: true });
@@ -406,6 +430,7 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   // ----- Other-stations hint (158, mirror of kitchen-ticket.ts) -----
   if (
     L.estacion !== false &&
+    L.otras_estaciones !== false &&
     p.other_stations_units != null &&
     p.other_stations_units > 0
   ) {
