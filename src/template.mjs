@@ -553,12 +553,16 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
         const pad = Math.max(1, COLS - label.length - v.length);
         esc.line(label + " ".repeat(pad) + v);
       };
-      sugRow(
-        f.suggested_tip_percent != null
-          ? `${tipWord} ${f.suggested_tip_percent}%`.slice(0, 16)
-          : tipWord,
-        f.suggested_tip
-      );
+      // `propina_sugerida_monto` (0.6.6), mirror of kitchen-ticket.ts: hides
+      // only the "Propina 10%" amount row.
+      if (L.propina_sugerida_monto !== false) {
+        sugRow(
+          f.suggested_tip_percent != null
+            ? `${tipWord} ${f.suggested_tip_percent}%`.slice(0, 16)
+            : tipWord,
+          f.suggested_tip
+        );
+      }
       plain();
       med({ bold: true });
       sugRow(`TOTAL CON ${TIP_WORD}`, f.total_with_suggested_tip);

@@ -364,6 +364,12 @@ print setting: with `"servicio"` every tip label on the recibo says
 `TOTAL CON SERVICIO`, `SIN / CON SERVICIO`). Older bridges ignore it and
 print `Propina`.
 
+**0.6.6 — hide the "Propina X%" row.** Honors the new
+`propina_sugerida_monto` line toggle, which drops only the `Propina 10%`
+amount row from the `PROPINA SUGERIDA (OPCIONAL)` block on the recibo; the
+heading and `TOTAL CON PROPINA` keep printing. Older bridges ignore the
+toggle and always print the row.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded
