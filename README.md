@@ -348,6 +348,16 @@ dishes again).
 the `ESTACIÓN: X` header. Older bridges ignore the toggle and still print the
 hint.
 
+**0.6.4 — thousands dots on Bs/COP.** Recibo amounts in Bs and COP print
+grouped (`12.432 Bs`, `1.539.300 $`); USD is unchanged. Where the dots would
+not fit — the double-width TOTAL on 58mm paper, or a TOTAL EN MONEDAS column
+narrowed by letter spacing — that figure (or the whole table) prints plain
+instead of being cut. Older bridges keep printing plain figures.
+
+0.6.4 also honors the new `total` line toggle, which hides the big
+double-width `TOTAL` headline on the recibo (the `Incluye IVA` rows under it
+still print). Older bridges ignore the toggle and always print it.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded

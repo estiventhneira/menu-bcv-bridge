@@ -50,10 +50,13 @@ function formatTime(iso) {
   } catch { return iso; }
 }
 
-function formatMoney(amount, currency, usdSymbol = "$") {
-  const fixed = currency === "USD" ? Number(amount).toFixed(2) : Math.round(Number(amount)).toString();
-  const sym = currency === "USD" ? usdSymbol : currency === "VES" ? "Bs" : "$";
-  return currency === "USD" ? `${sym}${fixed}` : `${fixed} ${sym}`;
+// Bs/COP get thousands dots ("12.432 Bs"); `group` false keeps the compact
+// legacy form for slots too narrow for them (mirror of kitchen-ticket.ts).
+function formatMoney(amount, currency, usdSymbol = "$", group = true) {
+  if (currency === "USD") return `${usdSymbol}${Number(amount).toFixed(2)}`;
+  const whole = Math.round(Number(amount)).toString();
+  const fixed = group ? whole.replace(/\B(?=(\d{3})+(?!\d))/g, ".") : whole;
+  return `${fixed} ${currency === "VES" ? "Bs" : "$"}`;
 }
 
 function centerIn(s, width) {
@@ -494,11 +497,18 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       plain();
     }
 
-    esc.align("center");
-    big({ bold: true });
-    const totalStr = formatMoney(f.total, f.currency, usdSymbol);
-    esc.line(`TOTAL ${totalStr}`.slice(0, COLS_BIG));
-    plain();
+    // `total` line toggle (0.6.4), mirror of kitchen-ticket.ts.
+    if (L.total !== false) {
+      esc.align("center");
+      big({ bold: true });
+      // Plain figure when the dotted one won't fit (mirror of kitchen-ticket.ts).
+      let totalLine = `TOTAL ${formatMoney(f.total, f.currency, usdSymbol)}`;
+      if (totalLine.length > COLS_BIG) {
+        totalLine = `TOTAL ${formatMoney(f.total, f.currency, usdSymbol, false)}`;
+      }
+      esc.line(totalLine.slice(0, COLS_BIG));
+      plain();
+    }
 
     // Impuestos incluidos (186) — disclosure rows INSIDE the total. Kept in
     // sync with kitchen-ticket.ts (both renderers consume the same payload).
@@ -617,9 +627,16 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
         plain();
 
         const colWidth = Math.floor(COLS / cells.length);
+        // Dotted only when every figure leaves a gap in its column, all or
+        // nothing (mirror of kitchen-ticket.ts).
+        const group = [...cells, ...withTip].every(
+          (c) => formatMoney(c.amount, c.currency, usdSymbol).length < colWidth,
+        );
         const valueRow = (row) =>
           row
-            .map((c) => centerIn(formatMoney(c.amount, c.currency, usdSymbol), colWidth))
+            .map((c) =>
+              centerIn(formatMoney(c.amount, c.currency, usdSymbol, group), colWidth),
+            )
             .join("");
         esc.align("left");
         med({ bold: true });
