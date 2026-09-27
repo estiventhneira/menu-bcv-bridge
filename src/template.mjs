@@ -128,6 +128,12 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   );
   const L = resolveLineToggles(settings, p.kind);
   const usdSymbol = settings.usd_symbol ?? "$";
+  // `tip_label` (0.6.5), mirror of kitchen-ticket.ts: "Servicio" instead of
+  // "Propina", with the adjective agreeing (sugerido / sugerida).
+  const servicio = settings.tip_label === "servicio";
+  const tipWord = servicio ? "Servicio" : "Propina";
+  const tipSuggested = servicio ? "sugerido" : "sugerida";
+  const TIP_WORD = tipWord.toUpperCase();
 
   // ----- Per-printer formatting (mirror of kitchen-ticket.ts) -----
   // Only emitted when non-default so an unconfigured printer prints
@@ -478,7 +484,7 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       // Matches kitchen-ticket.ts exactly: the charged tip is labeled
       // "(sugerida)" when the restaurant runs the propina-sugerida setting.
       if (f.tip && f.tip > 0) {
-        row(f.tip_is_suggested ? "Propina (sugerida)" : "Propina", f.tip);
+        row(f.tip_is_suggested ? `${tipWord} (${tipSuggested})` : tipWord, f.tip);
       }
       if (f.adjustment && f.adjustment !== 0) {
         // Matches kitchen-ticket.ts exactly: an EMPTY note falls back to
@@ -536,7 +542,9 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       plain();
       esc.align("center");
       med({ bold: true });
-      for (const ln of wrap("PROPINA SUGERIDA (OPCIONAL)", COLS)) esc.line(ln);
+      for (const ln of wrap(`${TIP_WORD} ${tipSuggested.toUpperCase()} (OPCIONAL)`, COLS)) {
+        esc.line(ln);
+      }
       plain();
       esc.align("left");
       med();
@@ -547,13 +555,13 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       };
       sugRow(
         f.suggested_tip_percent != null
-          ? `Propina ${f.suggested_tip_percent}%`.slice(0, 16)
-          : "Propina",
+          ? `${tipWord} ${f.suggested_tip_percent}%`.slice(0, 16)
+          : tipWord,
         f.suggested_tip
       );
       plain();
       med({ bold: true });
-      sugRow("TOTAL CON PROPINA", f.total_with_suggested_tip);
+      sugRow(`TOTAL CON ${TIP_WORD}`, f.total_with_suggested_tip);
       plain();
     }
 
@@ -643,7 +651,7 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
         esc.line(cells.map((c) => centerIn(c.currency, colWidth)).join(""));
         if (withTip.length > 0) {
           med({ bold: true });
-          esc.line("SIN PROPINA");
+          esc.line(`SIN ${TIP_WORD}`);
         }
         med();
         esc.line(valueRow(cells));
@@ -651,8 +659,8 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
           med({ bold: true });
           esc.line(
             (f.suggested_tip_percent != null
-              ? `CON PROPINA ${f.suggested_tip_percent}%`
-              : "CON PROPINA"
+              ? `CON ${TIP_WORD} ${f.suggested_tip_percent}%`
+              : `CON ${TIP_WORD}`
             ).slice(0, COLS)
           );
           med();

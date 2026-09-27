@@ -358,6 +358,12 @@ instead of being cut. Older bridges keep printing plain figures.
 double-width `TOTAL` headline on the recibo (the `Incluye IVA` rows under it
 still print). Older bridges ignore the toggle and always print it.
 
+**0.6.5 — "Servicio" instead of "Propina".** Honors the new `tip_label`
+print setting: with `"servicio"` every tip label on the recibo says
+`Servicio` (`Servicio (sugerido)`, `SERVICIO SUGERIDO (OPCIONAL)`,
+`TOTAL CON SERVICIO`, `SIN / CON SERVICIO`). Older bridges ignore it and
+print `Propina`.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded
