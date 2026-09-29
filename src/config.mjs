@@ -12,7 +12,7 @@
 //        "device_password": "<random>",
 //        "restaurants":     [{ "id": "<uuid>", "bridge_token_id": "<uuid>" }],
 //        "label":           "bridge@cocina",   // optional
-//        "poll_interval_ms": 30000,            // optional
+//        "poll_interval_ms": 30000,            // optional — fixed; default adaptive 5-15 s
 //        "max_attempts":     3                 // optional
 //      }
 //
@@ -65,12 +65,20 @@ export function loadConfig() {
 
   const common = {
     label: raw.label ?? `bridge@${os.hostname()}`,
-    // 5s poll = the printing latency CEILING. Field data showed realtime
-    // postgres_changes degrading to 15-30s (or dropping events outright)
-    // exactly during service hours, so the poll is the real latency
-    // guarantee and realtime is just the fast path. The query is a narrow
-    // indexed SELECT — negligible load even across a large fleet.
-    pollIntervalMs: Number(raw.poll_interval_ms ?? 5_000),
+    // The drain poll is the printing latency CEILING. Field data showed
+    // realtime postgres_changes degrading to 15-30s (or dropping events
+    // outright) exactly during service hours, so the poll is the real
+    // latency guarantee and realtime is just the fast path. The query is a
+    // narrow indexed SELECT, cheap for the DB — but Supabase bills Log
+    // Ingestion per API-gateway request, and a fixed 5s poll is 720
+    // requests/hour per bridge, all day, busy or not.
+    //
+    // So the default (null) is adaptive (0.6.7, drain-poll.mjs): 5s while
+    // realtime is unproven (a channel not SUBSCRIBED, or a drain found a job
+    // realtime missed in the last 10 min), 15s once realtime has been
+    // carrying every job. An explicit poll_interval_ms is honored as a fixed
+    // interval, the pre-0.6.7 behavior.
+    pollIntervalMs: Number(raw.poll_interval_ms) > 0 ? Number(raw.poll_interval_ms) : null,
     maxAttempts: Number(raw.max_attempts ?? 3),
     // Escape hatch for routers that dislike even the slow scan:
     // { "disable_discovery": true } turns network discovery off entirely.

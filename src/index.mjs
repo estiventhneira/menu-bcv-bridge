@@ -30,6 +30,7 @@ import { paperDotsForWidth } from "./raster-text.mjs";
 import { JETBRAINS_MONO } from "./fonts/jetbrains-mono.atlas.mjs";
 import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
+import { DRAIN_SLOW_MS, DRAIN_TICK_MS, drainDue, drainIntervalMs } from "./drain-poll.mjs";
 import crypto from "node:crypto";
 
 const argv = process.argv.slice(2);
@@ -325,9 +326,29 @@ async function runJob(job, printer) {
   }
 }
 
+// Adaptive poll state (0.6.7, see drain-poll.mjs). Times are performance.now()
+// — monotonic, so a wall-clock jump can't stall the poll.
+const channelStatus = new Map(); // restaurant id -> last realtime subscribe status
+const realtimeJobIds = new Set(); // pending jobs realtime delivered, oldest evicted
+let lastDrainAt = null;
+let lastMissAt = null;
+
+function noteRealtimeJob(job) {
+  if (job.status === "pending") {
+    realtimeJobIds.add(job.id);
+    // 500 ≫ the jobs a restaurant queues between two drains.
+    if (realtimeJobIds.size > 500) realtimeJobIds.delete(realtimeJobIds.values().next().value);
+  } else if (job.status === "held" && printers.has(job.printer_id)) {
+    // Manual print mode: the job is released by an UPDATE held→pending,
+    // which this INSERT-only channel never sees — the poll is its only path.
+    lastMissAt = performance.now();
+  }
+}
+
 async function drainPending() {
   const ids = Array.from(printers.keys());
   if (ids.length === 0) return;
+  const startedAt = performance.now();
   const { data, error } = await supabase
     .from("print_jobs")
     .select("*")
@@ -340,6 +361,11 @@ async function drainPending() {
     log("ERROR draining:", error.message);
     return;
   }
+  lastDrainAt = Math.max(lastDrainAt ?? 0, startedAt); // overlapping drains
+  // A pending job realtime never handed us: it is dropping (or lagging on)
+  // events, so poll fast for a while. A job seen here a moment before its
+  // event lands counts too — conservative, not wrong.
+  if ((data ?? []).some((j) => !realtimeJobIds.has(j.id))) lastMissAt = startedAt;
   for (const j of data ?? []) await processJob(j);
 }
 
@@ -363,7 +389,8 @@ function printerEventMatters(payload) {
 
 // One pending sweep max: a realtime job event arrived, so any siblings whose
 // events were dropped are sitting pending — pick them up in seconds, not at
-// the next 30s poll. processJob's atomic claim makes double-processing safe.
+// the next poll (up to 15s away). processJob's atomic claim makes
+// double-processing safe.
 let siblingDrainTimer = null;
 function scheduleSiblingDrain() {
   if (siblingDrainTimer) return;
@@ -439,10 +466,11 @@ async function main() {
           filter: `restaurant_id=eq.${rid}`,
         },
         (payload) => {
+          noteRealtimeJob(payload.new);
           void processJob(payload.new);
           // Realtime drops some rows of a multi-job burst (field report:
           // an order's kitchen ticket arrived, its receipts didn't and sat
-          // until the 30s poll). At least one sibling almost always lands,
+          // until the next poll). At least one sibling almost always lands,
           // so any arrival also sweeps for stragglers a moment later.
           scheduleSiblingDrain();
         },
@@ -457,7 +485,10 @@ async function main() {
         },
         (payload) => { if (printerEventMatters(payload)) schedulePrintersRefresh(); },
       )
-      .subscribe((status) => log(`realtime[${rid.slice(0, 8)}]:`, status)),
+      .subscribe((status) => {
+        channelStatus.set(rid, status);
+        log(`realtime[${rid.slice(0, 8)}]:`, status);
+      }),
   );
 
   // Reset any in_progress jobs that belong to us but predate this process —
@@ -469,7 +500,32 @@ async function main() {
     .eq("status", "in_progress")
     .in("printer_id", Array.from(printers.keys()));
 
-  setInterval(() => { void drainPending(); }, cfg.pollIntervalMs);
+  if (cfg.pollIntervalMs) {
+    log(`poll: fixed every ${cfg.pollIntervalMs / 1000}s (poll_interval_ms)`);
+    setInterval(() => { void drainPending(); }, cfg.pollIntervalMs);
+  } else {
+    let pollMs = null; // only for the mode-change log line
+    setInterval(() => {
+      const state = {
+        now: performance.now(),
+        lastDrainAt,
+        lastMissAt,
+        allSubscribed: cfg.restaurantIds.every((rid) => channelStatus.get(rid) === "SUBSCRIBED"),
+      };
+      const ms = drainIntervalMs(state);
+      if (ms !== pollMs) {
+        pollMs = ms;
+        const why = ms === DRAIN_SLOW_MS ? "realtime healthy"
+          : state.allSubscribed ? "recent job missed by realtime" : "realtime not subscribed";
+        log(`poll: every ${ms / 1000}s (${why})`);
+      }
+      if (!drainDue(state)) return;
+      // Stamp the attempt too: a failing or hung query must retry at the
+      // interval, not on every 1s tick.
+      lastDrainAt = state.now;
+      void drainPending();
+    }, DRAIN_TICK_MS);
+  }
   setInterval(() => { void heartbeat(); }, 30_000);
   setInterval(() => { void reloadPrinters(); }, 5 * 60_000);
 

@@ -117,7 +117,10 @@ restaurant's printers and print jobs:
 }
 ```
 
-Optional keys: `"poll_interval_ms": 30000`, `"max_attempts": 3`.
+Optional keys: `"poll_interval_ms": 30000`, `"max_attempts": 3`. Leave
+`poll_interval_ms` out unless you need a fixed pending-job poll: the default
+(0.6.7+) is adaptive — every 5 s while realtime is unproven, every 15 s once
+it is delivering every job.
 
 **One PC serving several restaurants (sucursales):** generate a code in each
 restaurant and run `pair` once per code — restaurants accumulate in the
@@ -369,6 +372,15 @@ print `Propina`.
 amount row from the `PROPINA SUGERIDA (OPCIONAL)` block on the recibo; the
 heading and `TOTAL CON PROPINA` keep printing. Older bridges ignore the
 toggle and always print the row.
+
+**0.6.7 — adaptive pending-job poll.** The poll that catches jobs realtime
+missed ran every 5 s all day (720 requests/hour per bridge, each one a billed
+Supabase API log line). It now runs every 5 s only while realtime is unproven
+— a channel not `SUBSCRIBED`, or a poll in the last 10 minutes found a job
+realtime never delivered (manual print mode's confirmed jobs count, since
+their release is an UPDATE the bridge doesn't subscribe to) — and every 15 s
+otherwise; any sweep restarts the clock. The log prints `poll: every Ns (…)`
+on each change. An explicit `poll_interval_ms` keeps the old fixed poll.
 
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
