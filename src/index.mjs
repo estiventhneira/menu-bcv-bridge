@@ -31,6 +31,7 @@ import { JETBRAINS_MONO } from "./fonts/jetbrains-mono.atlas.mjs";
 import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import { DRAIN_SLOW_MS, DRAIN_TICK_MS, drainDue, drainIntervalMs } from "./drain-poll.mjs";
+import { createPrinterChains, startJobs } from "./job-queue.mjs";
 import crypto from "node:crypto";
 
 const argv = process.argv.slice(2);
@@ -93,23 +94,8 @@ async function signInDevice() {
 // id -> { transport: 'wifi' | 'usb_bridge', name, host?, port?, os_printer_name? }
 const printers = new Map();
 const inFlight = new Set();
-// Per-printer promise chain — drive each printer one job at a time (mirror of
-// src/lib/printing/printer-serial.ts). Station splits put several rows per
-// order on one printer; a second TCP socket to a printer mid-ticket is
-// refused or interleaved by some firmwares, and the spooler path is cheap to
-// serialize. Different printers still run in parallel.
-const printerChains = new Map();
-function serialized(printerId, fn) {
-  const prev = printerChains.get(printerId) ?? Promise.resolve();
-  const result = prev.then(fn);
-  // The chain itself never rejects — a failed job must not block the next.
-  const tail = result.then(() => undefined, () => undefined);
-  printerChains.set(printerId, tail);
-  tail.then(() => {
-    if (printerChains.get(printerId) === tail) printerChains.delete(printerId);
-  });
-  return result;
-}
+// One job at a time per printer, printers in parallel — see job-queue.mjs.
+const serialized = createPrinterChains();
 // Discovery reporter (device mode only) — see discover.mjs.
 let discovery = null;
 
@@ -294,10 +280,7 @@ async function runJob(job, printer) {
     } else {
       throw new Error(`unknown transport: ${printer.transport}`);
     }
-    await supabase
-      .from("print_jobs")
-      .update({ status: "done", completed_at: new Date().toISOString(), error: null })
-      .eq("id", job.id);
+    await markDone(job.id);
     log(`ok job ${job.id} (${bytes.length} bytes)`);
   } catch (e) {
     log(`FAIL job ${job.id}: ${e.message}`);
@@ -314,7 +297,7 @@ async function runJob(job, printer) {
       .single();
     const attempts = (cur?.attempts ?? 0) + 1;
     const giveUp = attempts >= cfg.maxAttempts;
-    await supabase
+    const { error: requeueErr } = await supabase
       .from("print_jobs")
       .update({
         status: giveUp ? "failed" : "pending",
@@ -323,6 +306,52 @@ async function runJob(job, printer) {
         claimed_at: null,
       })
       .eq("id", job.id);
+    // Left in_progress — reapStuckJobs re-queues it within minutes.
+    if (requeueErr) log(`ERROR requeueing job ${job.id}:`, requeueErr.message);
+  }
+}
+
+/**
+ * Ack a printed job, retrying a failed write: a job left in_progress after it
+ * printed would be re-queued by reapStuckJobs 5 min later and print twice.
+ */
+async function markDone(jobId) {
+  for (let attempt = 1; ; attempt++) {
+    const { error } = await supabase
+      .from("print_jobs")
+      .update({ status: "done", completed_at: new Date().toISOString(), error: null })
+      .eq("id", jobId);
+    if (!error) return;
+    if (attempt === 3) {
+      log(`ERROR marking job ${jobId} done:`, error.message);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 2_000 * attempt));
+  }
+}
+
+// Stuck-claim reaper (0.6.8). A job can be left in_progress with nobody
+// printing it — the claim committed but its response was lost in a network
+// blip, and the requeue write above failed the same way. Only the startup
+// reset in main() recovered those, and the browsers' reaper never runs where
+// every printer is on a bridge: a Pronto Gourmet precuenta waited 4.7 h
+// (2026-10-01) with a bridge restart as its only way back to the queue.
+// Same RPC the browsers call: in_progress for 5+ min → pending, attempts + 1.
+// Its other half (cancel jobs held 30+ min) is the browsers' rule too; a
+// device account can't touch held rows, so for it that half matches nothing.
+// Every 5 min rather than the browsers' 1: each call is a billed API log line
+// (see drain-poll.mjs), and a stuck job is still back within 10 min.
+const REAPER_INTERVAL_MS = 5 * 60_000;
+
+async function reapStuckJobs() {
+  for (const rid of cfg.restaurantIds) {
+    const { data, error } = await supabase.rpc("reset_stuck_print_jobs", { p_restaurant_id: rid });
+    if (error) {
+      log("ERROR reaper:", error.message);
+    } else if (data > 0) {
+      log(`reaper: re-queued ${data} stuck job(s)`);
+      scheduleSiblingDrain();
+    }
   }
 }
 
@@ -366,7 +395,7 @@ async function drainPending() {
   // events, so poll fast for a while. A job seen here a moment before its
   // event lands counts too — conservative, not wrong.
   if ((data ?? []).some((j) => !realtimeJobIds.has(j.id))) lastMissAt = startedAt;
-  for (const j of data ?? []) await processJob(j);
+  await startJobs(data ?? [], processJob);
 }
 
 // Columns that change what/how the bridge prints. Heartbeat/claim writes
@@ -528,6 +557,7 @@ async function main() {
   }
   setInterval(() => { void heartbeat(); }, 30_000);
   setInterval(() => { void reloadPrinters(); }, 5 * 60_000);
+  setInterval(() => { void reapStuckJobs(); }, REAPER_INTERVAL_MS);
 
   process.on("SIGINT", async () => {
     log("shutting down…");

@@ -382,6 +382,20 @@ their release is an UPDATE the bridge doesn't subscribe to) — and every 15 s
 otherwise; any sweep restarts the clock. The log prints `poll: every Ns (…)`
 on each change. An explicit `poll_interval_ms` keeps the old fixed poll.
 
+**0.6.8 — one dead printer no longer stalls the others; stuck jobs come
+back.** A sweep of pending jobs (the poll, or the backlog after the PC's
+internet drops) printed them one at a time across all printers, so a printer
+that stopped answering (10 s connect timeout, three attempts) held every other
+station's comanda behind it. Jobs from a sweep now start together; each
+printer still prints its own jobs in order. Also: a job whose claim went
+through but whose acknowledgement was lost in a network blip stayed
+`in_progress` until the bridge restarted (one precuenta waited 4.7 h). Every
+5 minutes the bridge now runs the same `reset_stuck_print_jobs` sweep the
+browsers run, which re-queues anything stuck for 5+ minutes, and it retries
+the "done" acknowledgement so a printed ticket is not re-queued and printed
+twice. The log shows `reaper: re-queued N stuck job(s)` when it recovers
+something.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded
