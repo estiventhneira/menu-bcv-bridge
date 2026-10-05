@@ -13,8 +13,17 @@
 //        "restaurants":     [{ "id": "<uuid>", "bridge_token_id": "<uuid>" }],
 //        "label":           "bridge@cocina",   // optional
 //        "poll_interval_ms": 30000,            // optional — fixed; default adaptive 5-15 s
-//        "max_attempts":     3                 // optional
+//        "max_attempts":     3,                // optional
+//        // LAN print server (0.7.0) — all optional:
+//        "lan_port":         7373,
+//        "disable_lan_server": false,
+//        "app_origin":       "https://andescocina.com",   // written by `pair`
+//        "allowed_origins":  ["http://localhost:3000"],   // extra CORS origins
+//        "device_user_id":   "<uuid>"          // written after the first sign-in
 //      }
+//    plus "lan_secrets": [{ bridge_token_id, restaurant_id, lan_secret }] —
+//    the HMAC keys for LAN tokens, written by `pair` and replaced from
+//    bridge_lan_secrets() on every online start.
 //
 //  * Legacy config (service_role_key + restaurant_ids). Still runs, with a
 //    loud deprecation warning — re-pair to migrate. The service key will be
@@ -54,6 +63,50 @@ export function saveConfigRaw(raw) {
   return p;
 }
 
+/**
+ * Read-modify-write of the raw config for values the bridge learns at runtime
+ * (device user id, LAN secrets). `mutate` returns true when it changed
+ * something; nothing is written otherwise. Never throws — a read-only disk
+ * must not take printing down.
+ * @param {(raw: Record<string, any>) => boolean} mutate
+ */
+export function updateConfigRaw(mutate) {
+  try {
+    const raw = readConfigRaw();
+    if (!raw) return false;
+    if (!mutate(raw)) return false;
+    saveConfigRaw(raw);
+    return true;
+  } catch (e) {
+    console.error(`No se pudo actualizar ${configPath()}: ${e.message}`);
+    return false;
+  }
+}
+
+/** Directory for the bridge's runtime state (printer cache, LAN journal):
+ *  next to config.json, so PRINT_BRIDGE_CONFIG relocates it too. */
+export function stateDir() {
+  return path.dirname(configPath());
+}
+
+/**
+ * @param {unknown} list raw `lan_secrets`
+ * @returns {Array<{ bridgeTokenId: string, restaurantId: string, secret: string }>}
+ */
+export function parseLanSecrets(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(
+      (x) =>
+        x &&
+        typeof x.bridge_token_id === "string" &&
+        typeof x.restaurant_id === "string" &&
+        typeof x.lan_secret === "string" &&
+        x.lan_secret.length >= 16,
+    )
+    .map((x) => ({ bridgeTokenId: x.bridge_token_id, restaurantId: x.restaurant_id, secret: x.lan_secret }));
+}
+
 export function loadConfig() {
   const p = configPath();
   const raw = readConfigRaw();
@@ -89,6 +142,16 @@ export function loadConfig() {
     updateRepo: typeof raw.update_repo === "string" && raw.update_repo.trim()
       ? raw.update_repo.trim()
       : null,
+    // LAN print server (0.7.0): tablets hand tickets to the bridge over the
+    // restaurant network, with or without internet (lan-server.mjs).
+    lanPort: Number.isInteger(raw.lan_port) && raw.lan_port > 0 && raw.lan_port < 65536
+      ? raw.lan_port
+      : 7373,
+    disableLanServer: raw.disable_lan_server === true,
+    appOrigin: typeof raw.app_origin === "string" ? raw.app_origin : null,
+    allowedOrigins: Array.isArray(raw.allowed_origins)
+      ? raw.allowed_origins.filter((o) => typeof o === "string")
+      : [],
   };
 
   // Device shape (0.3.0+)
@@ -113,6 +176,10 @@ export function loadConfig() {
       deviceEmail: raw.device_email,
       devicePassword: raw.device_password,
       restaurantIds: restaurants.map((r) => r.id),
+      // LAN tokens name the pairing (bridge_tokens row) they were minted
+      // for; that row's secret checks them.
+      lanSecrets: parseLanSecrets(raw.lan_secrets),
+      deviceUserId: typeof raw.device_user_id === "string" && raw.device_user_id ? raw.device_user_id : null,
       ...common,
     };
   }

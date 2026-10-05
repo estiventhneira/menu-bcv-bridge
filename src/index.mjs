@@ -3,8 +3,13 @@
  * fujun-bridge — local WiFi print bridge.
  *
  * Connects to Supabase, watches `print_jobs` for the configured restaurants,
- * and forwards any pending job whose target printer has transport='wifi'
- * to that printer over TCP:9100.
+ * and prints every pending job whose target printer is driven from this PC:
+ * transport 'wifi' over TCP:9100, 'usb_bridge' through the OS spooler.
+ *
+ * 0.7.0 adds a LAN print server (lan-server.mjs): tablets on the restaurant
+ * network hand tickets straight to this process — LAN-first while online,
+ * and the only way to reach these printers while the internet is down. The
+ * bridge also boots without internet now, from a cached printer list.
  *
  * One process can drive many printers across one or more restaurants on the
  * same PC (e.g. a restaurant and its sucursal): run `pair` once per
@@ -18,7 +23,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
-import { loadConfig } from "./config.mjs";
+import { loadConfig, parseLanSecrets, stateDir, updateConfigRaw } from "./config.mjs";
 import { runPair } from "./pair.mjs";
 import { startDiscovery, isConnectionError } from "./discover.mjs";
 import { startSelfUpdate } from "./self-update.mjs";
@@ -32,7 +37,13 @@ import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import { DRAIN_SLOW_MS, DRAIN_TICK_MS, drainDue, drainIntervalMs } from "./drain-poll.mjs";
 import { createPrinterChains, startJobs } from "./job-queue.mjs";
+import { buildAllowedOrigins, createLanServer } from "./lan-server.mjs";
+import { createLanStore, LAN_MAX_ATTEMPTS, lanRetryDelayMs } from "./lan-journal.mjs";
+import { peekLanTokenClaims, verifyLanToken } from "./lan-token.mjs";
+import { lanAddresses, startLanEndpointsReporter } from "./lan-endpoints.mjs";
+import { loadPrinterCache, savePrinterCache } from "./printer-cache.mjs";
 import crypto from "node:crypto";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
 if (argv[0] === "pair") {
@@ -61,10 +72,14 @@ const supabase = createClient(
   },
 );
 
-// Device mode: assigned after sign-in as `bridge:<auth user id>` (stable
-// across label edits, and what the claim/heartbeat RPCs stamp server-side).
-// Legacy mode keeps the historical label-hash id.
-let DEVICE_ID = `bridge:${crypto.createHash("sha1").update(cfg.label).digest("hex").slice(0, 16)}`;
+// Device mode: `bridge:<auth user id>` (stable across label edits, and what
+// the claim/heartbeat RPCs stamp server-side). Known before sign-in when a
+// previous run persisted the uid (0.7.0) — an offline boot still answers LAN
+// hellos with the right "this printer is mine". Legacy mode keeps the
+// historical label-hash id.
+let DEVICE_ID = cfg.mode === "device" && cfg.deviceUserId
+  ? `bridge:${cfg.deviceUserId}`
+  : `bridge:${crypto.createHash("sha1").update(cfg.label).digest("hex").slice(0, 16)}`;
 
 /**
  * Signs in with the device credentials, retrying forever on transient errors
@@ -91,13 +106,34 @@ async function signInDevice() {
   }
 }
 
-// id -> { transport: 'wifi' | 'usb_bridge', name, host?, port?, os_printer_name? }
+// id -> { restaurant_id, transport: 'wifi' | 'usb_bridge', name, host?, port?, os_printer_name?, ... }
 const printers = new Map();
 const inFlight = new Set();
 // One job at a time per printer, printers in parallel — see job-queue.mjs.
 const serialized = createPrinterChains();
 // Discovery reporter (device mode only) — see discover.mjs.
 let discovery = null;
+
+// ── LAN print server state (0.7.0, device mode only) ─────────────────────
+const STATE_DIR = stateDir();
+const PRINTER_CACHE_FILE = path.join(STATE_DIR, "cache", "printers.json");
+const lanEnabled = cfg.mode === "device" && !cfg.disableLanServer;
+let lanStore = null;
+if (lanEnabled) {
+  try {
+    lanStore = createLanStore({ dir: path.join(STATE_DIR, "lan"), log });
+  } catch (e) {
+    console.error(`LAN: no se pudo abrir ${path.join(STATE_DIR, "lan")} (${e.message}) — impresión por red local desactivada`);
+  }
+}
+// bridge_tokens.id -> { bridgeTokenId, restaurantId, secret } (LAN token keys)
+let lanSecrets = new Map((cfg.lanSecrets ?? []).map((x) => [x.bridgeTokenId, x]));
+let lanPort = null; // set once the LAN server is listening
+let lanEndpoints = null;
+// True once the device signed in: cloud claims/acks are only attempted then
+// (an anon update is a silent 0-row no-op, indistinguishable from "lost").
+let cloudReady = cfg.mode !== "device";
+const lanRetryTimers = new Map(); // job_key -> timeout
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -106,7 +142,7 @@ function log(...args) {
 async function reloadPrinters() {
   const { data, error } = await supabase
     .from("printers")
-    .select("id, name, transport, connection, is_active, chars_per_line, paper_width_mm, print_settings, claimed_by_device_id")
+    .select("id, restaurant_id, name, transport, connection, is_active, chars_per_line, paper_width_mm, print_settings, claimed_by_device_id")
     .in("restaurant_id", cfg.restaurantIds)
     .in("transport", ["wifi", "usb_bridge"])
     .eq("is_active", true);
@@ -128,6 +164,7 @@ async function reloadPrinters() {
     if (p.transport === "wifi") {
       if (!c.host) continue;
       printers.set(p.id, {
+        restaurant_id: p.restaurant_id,
         transport: "wifi",
         name: p.name,
         host: c.host,
@@ -140,6 +177,7 @@ async function reloadPrinters() {
     } else if (p.transport === "usb_bridge") {
       if (!c.os_printer_name) continue;
       printers.set(p.id, {
+        restaurant_id: p.restaurant_id,
         transport: "usb_bridge",
         name: p.name,
         os_printer_name: c.os_printer_name,
@@ -160,8 +198,38 @@ async function reloadPrinters() {
     lastTrackedSignature = signature;
     log(`tracking ${printers.size} printer(s):`, signature);
   }
+  savePrintersForOfflineBoot();
+  // A LAN ticket queued while its printer was unknown (cold offline boot) or
+  // since removed: resume it now, or park it as failed.
+  resumeLanQueue({ afterCloudReload: true });
 }
 let lastTrackedSignature = null;
+
+// Offline boot (0.7.0): the list above is written to disk on every change and
+// read back before sign-in, so a PC that boots without internet still prints
+// what tablets send over the LAN.
+let lastCachedJson = null;
+function savePrintersForOfflineBoot() {
+  if (!lanEnabled) return;
+  const json = JSON.stringify([...printers.entries()]);
+  if (json === lastCachedJson) return;
+  try {
+    savePrinterCache(PRINTER_CACHE_FILE, printers);
+    lastCachedJson = json;
+  } catch (e) {
+    log(`ERROR guardando la lista de impresoras: ${e.message}`);
+  }
+}
+
+function restorePrintersFromCache() {
+  const cached = loadPrinterCache(PRINTER_CACHE_FILE);
+  if (!cached) return;
+  for (const { id, ...p } of cached.printers) {
+    if (cfg.restaurantIds.includes(p.restaurant_id)) printers.set(id, p);
+  }
+  lastCachedJson = JSON.stringify([...printers.entries()]);
+  log(`printers: ${printers.size} desde la caché local (guardada ${cached.savedAt ?? "?"})`);
+}
 
 async function claimPrinters() {
   // Atomically claim our printers to this bridge so the UI shows it's online.
@@ -235,60 +303,142 @@ async function heartbeat() {
 
 async function processJob(job) {
   if (inFlight.has(job.id)) return;
+  // 0.7.0: a cloud row this bridge already printed (over the LAN, or its
+  // `done` ack never landed) came back — via realtime, the poll, or the
+  // 5-min reaper re-pending it. Ack it; never print it twice.
+  if (!job.lan && lanStore?.isPrinted(job.id)) {
+    await ackJournaled(job.id);
+    return;
+  }
   const printer = printers.get(job.printer_id);
   if (!printer) return; // not our printer
   inFlight.add(job.id);
   try {
     // The claim waits inside the chain, so a queued job stays 'pending'
     // (never reaped as stuck) and a poll re-delivery hits the guard above.
-    await serialized(job.printer_id, () => runJob(job, printer));
+    return await serialized(job.printer_id, () => runJob(job, printer));
   } finally {
     inFlight.delete(job.id);
   }
 }
 
+/** ESC/POS bytes for a job on this printer (same renderers for every path). */
+function renderJob(job, printer) {
+  // caja_movement (240) = retiro/ingreso voucher — same section renderer as
+  // the cierre report, so one branch covers both.
+  // Raster font (print_settings.font = "raster:jetbrains-mono"): the
+  // renderer only uses the atlas when the settings name it, so passing it
+  // unconditionally is safe — ROM-font printers stay byte-identical.
+  const renderOpts = { rasterFont: JETBRAINS_MONO, paperDots: printer.paper_dots };
+  return job.kind === "caja_report" || job.kind === "caja_movement"
+    ? renderCajaReport(job.payload, printer.chars_per_line, printer.print_settings, renderOpts)
+    : renderKitchenTicket(job.payload, printer.chars_per_line, printer.print_settings, renderOpts);
+}
+
+async function sendToPrinter(printer, bytes) {
+  if (printer.transport === "wifi") {
+    await sendOverTcp(printer.host, printer.port, bytes);
+  } else if (printer.transport === "usb_bridge") {
+    await sendOverSpooler(printer.os_printer_name, bytes);
+  } else {
+    throw new Error(`unknown transport: ${printer.transport}`);
+  }
+}
+
+function noteSendFailure(printer, e) {
+  // A wifi printer that stopped answering may have moved to a new DHCP
+  // address — rescan (debounced) so the app can suggest the fix.
+  if (printer.transport === "wifi" && isConnectionError(e)) {
+    discovery?.triggerFailureRescan();
+  }
+}
+
+/** Resolves `fallback` if `p` hasn't settled within `ms`. */
+function within(p, ms, fallback) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(p).finally(() => clearTimeout(timer)),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); }),
+  ]);
+}
+
+/** Signed in with a live session — claims/acks would otherwise run as anon
+ *  and silently match 0 rows. Bounded: an expired token refreshes over the
+ *  network, which must not stall a LAN print. */
+async function hasCloudSession() {
+  if (cfg.mode !== "device") return true;
+  if (!cloudReady) return false;
+  return within(
+    supabase.auth.getSession().then(({ data }) => !!data?.session, () => false),
+    2_000,
+    false,
+  );
+}
+
+/**
+ * @returns {Promise<"printed" | "skipped" | "failed">}
+ */
 async function runJob(job, printer) {
+  if (job.lan?.source === "offline") return runOfflineLanJob(job, printer);
+  // A cloud print_jobs row: from realtime / the poll, or forwarded over the
+  // LAN by the tablet that just created it (job.lan set).
+  const lan = job.lan ?? null;
+  let claimed = false;
+  let blind = false;
   try {
-    // Atomic claim: only proceed if we were the one to flip pending→in_progress.
-    const { data: claimed, error: claimErr } = await supabase
-      .from("print_jobs")
-      .update({ status: "in_progress", claimed_at: new Date().toISOString() })
-      .eq("id", job.id)
-      .eq("status", "pending")
-      .select("id")
-      .maybeSingle();
-    if (claimErr) throw claimErr;
-    if (!claimed) {
-      log(`skip job ${job.id} (already claimed)`);
-      return;
+    if (lan && !(await hasCloudSession())) {
+      blind = true;
+    } else {
+      // Atomic claim: only proceed if we were the one to flip pending→in_progress.
+      let claim = supabase
+        .from("print_jobs")
+        .update({ status: "in_progress", claimed_at: new Date().toISOString() })
+        .eq("id", job.id)
+        .eq("status", "pending");
+      // A LAN request names the row; pin it to what the token and the
+      // request vouch for, so a mismatch reads as "not mine" (0 rows).
+      if (lan) claim = claim.eq("restaurant_id", job.restaurant_id).eq("printer_id", job.printer_id).eq("kind", job.kind);
+      const claimQuery = claim.select("id").maybeSingle();
+      const { data: claimedRow, error: claimErr } = lan
+        ? await within(claimQuery, 4_000, { data: null, error: { message: "timeout" } })
+        : await claimQuery;
+      if (claimErr) {
+        if (!lan) throw claimErr;
+        // Forwarded over the LAN and the cloud didn't answer: print anyway.
+        // The journal acks the row once the cloud is back, and this bridge
+        // never prints a journaled row twice.
+        blind = true;
+      } else if (!claimedRow) {
+        // Printed by someone else, held, or cancelled — never journal it.
+        log(`skip job ${job.id} (already claimed)`);
+        return "skipped";
+      } else {
+        claimed = true;
+      }
     }
 
-    log(`printing job ${job.id} → ${printer.name} (${printer.transport})`);
-    // caja_movement (240) = retiro/ingreso voucher — same section renderer as
-    // the cierre report, so one branch covers both.
-    // Raster font (print_settings.font = "raster:jetbrains-mono"): the
-    // renderer only uses the atlas when the settings name it, so passing it
-    // unconditionally is safe — ROM-font printers stay byte-identical.
-    const renderOpts = { rasterFont: JETBRAINS_MONO, paperDots: printer.paper_dots };
-    const bytes = job.kind === "caja_report" || job.kind === "caja_movement"
-      ? renderCajaReport(job.payload, printer.chars_per_line, printer.print_settings, renderOpts)
-      : renderKitchenTicket(job.payload, printer.chars_per_line, printer.print_settings, renderOpts);
-    if (printer.transport === "wifi") {
-      await sendOverTcp(printer.host, printer.port, bytes);
-    } else if (printer.transport === "usb_bridge") {
-      await sendOverSpooler(printer.os_printer_name, bytes);
-    } else {
-      throw new Error(`unknown transport: ${printer.transport}`);
+    log(`printing job ${job.id} → ${printer.name} (${printer.transport})${lan ? " [red local]" : ""}${blind ? " [sin nube]" : ""}`);
+    const bytes = renderJob(job, printer);
+    await sendToPrinter(printer, bytes);
+    if (blind) {
+      lanStore?.markPrinted(job.id, { src: "cloud", pid: job.printer_id, kind: job.kind, acked: false });
+      log(`ok job ${job.id} (${bytes.length} bytes, se confirma al volver la conexión)`);
+      return "printed";
     }
-    await markDone(job.id);
+    const acked = await markDone(job.id);
+    // Journal LAN prints, and any print whose ack failed: the reaper would
+    // re-pend that row in 5 min and the poll would print it again.
+    if (lan || !acked) {
+      lanStore?.markPrinted(job.id, { src: "cloud", pid: job.printer_id, kind: job.kind, acked });
+    }
     log(`ok job ${job.id} (${bytes.length} bytes)`);
+    return "printed";
   } catch (e) {
     log(`FAIL job ${job.id}: ${e.message}`);
-    // A wifi printer that stopped answering may have moved to a new DHCP
-    // address — rescan (debounced) so the app can suggest the fix.
-    if (printer.transport === "wifi" && isConnectionError(e)) {
-      discovery?.triggerFailureRescan();
-    }
+    noteSendFailure(printer, e);
+    // Never claimed (printed blind over the LAN): the row is still pending in
+    // the cloud and this bridge picks it up from there when it reconnects.
+    if (lan && !claimed) return "failed";
     // Bump attempts; mark failed when too many.
     const { data: cur } = await supabase
       .from("print_jobs")
@@ -308,12 +458,14 @@ async function runJob(job, printer) {
       .eq("id", job.id);
     // Left in_progress — reapStuckJobs re-queues it within minutes.
     if (requeueErr) log(`ERROR requeueing job ${job.id}:`, requeueErr.message);
+    return "failed";
   }
 }
 
 /**
  * Ack a printed job, retrying a failed write: a job left in_progress after it
  * printed would be re-queued by reapStuckJobs 5 min later and print twice.
+ * @returns {Promise<boolean>} whether the ack landed
  */
 async function markDone(jobId) {
   for (let attempt = 1; ; attempt++) {
@@ -321,13 +473,295 @@ async function markDone(jobId) {
       .from("print_jobs")
       .update({ status: "done", completed_at: new Date().toISOString(), error: null })
       .eq("id", jobId);
-    if (!error) return;
+    if (!error) return true;
     if (attempt === 3) {
       log(`ERROR marking job ${jobId} done:`, error.message);
-      return;
+      return false;
     }
     await new Promise((r) => setTimeout(r, 2_000 * attempt));
   }
+}
+
+// ── LAN print server (0.7.0) ─────────────────────────────────────────────
+
+/**
+ * An offline-created ticket (no print_jobs row exists, and none will: the
+ * tablet reported the pair as printed once we accepted it). The durable
+ * queue file is the only record, so failures retry locally and finally park
+ * as "failed" for a manual reprint from Configuración > Impresoras.
+ */
+async function runOfflineLanJob(job, printer) {
+  try {
+    log(`printing LAN job ${job.id} → ${printer.name} (${printer.transport}, pedido sin conexión)`);
+    const bytes = renderJob(job, printer);
+    await sendToPrinter(printer, bytes);
+    lanStore.markPrinted(job.id, { src: "offline", pid: job.printer_id, kind: job.kind, acked: true });
+    log(`ok LAN job ${job.id} (${bytes.length} bytes)`);
+    return "printed";
+  } catch (e) {
+    log(`FAIL LAN job ${job.id}: ${e.message}`);
+    noteSendFailure(printer, e);
+    const rec = lanStore.getJob(job.id);
+    if (!rec) return "failed";
+    const attempts = (rec.attempts ?? 0) + 1;
+    if (attempts >= LAN_MAX_ATTEMPTS) {
+      lanStore.saveJob({ ...rec, attempts, state: "failed", last_error: e.message, failed_at: Date.now() });
+      log(`LAN job ${job.id} sin imprimir tras ${attempts} intentos — reimprímelo desde Configuración > Impresoras`);
+    } else {
+      lanStore.saveJob({ ...rec, attempts, last_error: e.message });
+      scheduleLanRetry(job.id, lanRetryDelayMs(attempts));
+    }
+    return "failed";
+  }
+}
+
+function lanJobFromRecord(rec) {
+  return {
+    id: rec.job_key,
+    restaurant_id: rec.restaurant_id,
+    printer_id: rec.printer_id,
+    kind: rec.kind,
+    payload: rec.payload,
+    status: "pending",
+    lan: { source: "offline" },
+  };
+}
+
+function submitLanJob(job) {
+  processJob(job).catch((e) => log(`ERROR LAN job ${job.id}: ${e?.message ?? e}`));
+}
+
+function scheduleLanRetry(key, ms) {
+  if (lanRetryTimers.has(key)) return;
+  lanRetryTimers.set(key, setTimeout(() => {
+    lanRetryTimers.delete(key);
+    const rec = lanStore?.getJob(key);
+    if (rec && rec.state === "queued") submitLanJob(lanJobFromRecord(rec));
+  }, ms));
+}
+
+/**
+ * Re-submit queued offline tickets: at boot (the queue survives restarts)
+ * and after each cloud printer reload. A ticket whose printer the cloud no
+ * longer lists (deleted / deactivated) is parked as failed.
+ */
+function resumeLanQueue({ afterCloudReload = false } = {}) {
+  if (!lanStore || lanPort === null) return;
+  for (const rec of lanStore.queuedJobs()) {
+    if (inFlight.has(rec.job_key) || lanRetryTimers.has(rec.job_key)) continue;
+    if (printers.has(rec.printer_id)) {
+      submitLanJob(lanJobFromRecord(rec));
+    } else if (afterCloudReload) {
+      lanStore.saveJob({ ...rec, state: "failed", last_error: "impresora no encontrada", failed_at: Date.now() });
+      log(`LAN job ${rec.job_key}: la impresora ya no existe — marcado como fallido`);
+    }
+  }
+}
+
+/** Ack a journaled cloud row (printed here, `done` never confirmed). */
+async function ackJournaled(jobId) {
+  if (!lanStore || !(await hasCloudSession())) return;
+  const { error } = await supabase
+    .from("print_jobs")
+    .update({ status: "done", completed_at: new Date().toISOString(), error: null })
+    .eq("id", jobId)
+    .in("status", ["pending", "in_progress"]);
+  if (error) {
+    log(`ERROR confirmando job ${jobId}:`, error.message);
+    return;
+  }
+  // 0 rows is fine too: already done, cancelled or purged — nothing to fix.
+  lanStore.markAcked(jobId);
+}
+
+let flushingAcks = false;
+async function flushJournalAcks() {
+  if (!lanStore || flushingAcks) return;
+  const keys = lanStore.unackedCloudKeys();
+  if (keys.length === 0) return;
+  flushingAcks = true;
+  try {
+    for (const key of keys) await ackJournaled(key);
+    const left = lanStore.unackedCloudKeys().length;
+    log(`lan: ${keys.length - left} impresión(es) confirmada(s) en la nube${left ? `, ${left} pendiente(s)` : ""}`);
+  } finally {
+    flushingAcks = false;
+  }
+}
+
+function verifyLanRequestToken(token) {
+  const peek = peekLanTokenClaims(token);
+  if (!peek) return { ok: false, reason: "malformed" };
+  const sec = lanSecrets.get(peek.t);
+  if (!sec) return { ok: false, reason: "unknown_pairing" };
+  if (sec.restaurantId !== peek.r || !cfg.restaurantIds.includes(peek.r)) {
+    return { ok: false, reason: "restaurant" };
+  }
+  return verifyLanToken(sec.secret, token);
+}
+
+function lanHello(claims) {
+  const list = [...printers.entries()]
+    .filter(([, p]) => p.restaurant_id === claims.r)
+    .map(([id, p]) => ({ id, name: p.name, transport: p.transport, claimed_by_me: p.claimed_by === DEVICE_ID }));
+  const failed = (lanStore?.failedJobs({ restaurantId: claims.r }) ?? []).map((j) => ({
+    job_key: j.job_key,
+    printer_id: j.printer_id,
+    kind: j.kind,
+    order: j.payload?.order_number ?? null,
+    error: j.last_error ?? null,
+    at: j.failed_at ? new Date(j.failed_at).toISOString() : null,
+  }));
+  return {
+    device_id: DEVICE_ID,
+    now: new Date().toISOString(),
+    restaurant_id: claims.r,
+    cloud: cloudReady,
+    printers: list,
+    failed,
+  };
+}
+
+function lanPrint(claims, job) {
+  const printer = printers.get(job.printer_id);
+  if (!printer || printer.restaurant_id !== claims.r) {
+    return { status: 404, body: { ok: false, error: "unknown_printer" } };
+  }
+  if (lanStore.isPrinted(job.job_key)) return { status: 200, body: { ok: true, status: "duplicate" } };
+  const existing = lanStore.getJob(job.job_key);
+  if (existing) {
+    return existing.state === "failed"
+      ? { status: 200, body: { ok: false, status: "failed", error: existing.last_error ?? null } }
+      : { status: 200, body: { ok: true, status: "duplicate" } };
+  }
+  if (inFlight.has(job.job_key)) return { status: 200, body: { ok: true, status: "in_progress" } };
+
+  if (job.source === "offline") {
+    // "accepted" = durably queued: the tablet reports this pair as printed and
+    // the server will never create a cloud job for it.
+    try {
+      lanStore.saveJob({
+        job_key: job.job_key,
+        source: "offline",
+        restaurant_id: claims.r,
+        printer_id: job.printer_id,
+        kind: job.kind,
+        payload: job.payload,
+        user_id: claims.u,
+        accepted_at: Date.now(),
+        attempts: 0,
+        state: "queued",
+        last_error: null,
+      });
+    } catch (e) {
+      log(`ERROR guardando LAN job ${job.job_key}: ${e.message}`);
+      return { status: 503, body: { ok: false, error: "disk" } };
+    }
+  }
+  log(`lan: ${job.kind} → ${printer.name} (${job.source === "offline" ? "pedido sin conexión" : "red local"}, ${job.job_key.slice(0, 12)})`);
+  submitLanJob({
+    id: job.job_key,
+    restaurant_id: claims.r,
+    printer_id: job.printer_id,
+    kind: job.kind,
+    payload: job.payload,
+    status: "pending",
+    lan: { source: job.source },
+  });
+  return { status: 202, body: { ok: true, status: "accepted" } };
+}
+
+function lanRetry(claims, key) {
+  const rec = lanStore.getJob(key);
+  if (!rec || rec.restaurant_id !== claims.r) return { status: 404, body: { ok: false, error: "unknown_job" } };
+  if (rec.state !== "failed") return { status: 200, body: { ok: true, status: "queued" } };
+  lanStore.saveJob({ ...rec, state: "queued", attempts: 0, last_error: null, failed_at: null });
+  log(`lan: reimprimiendo ${key} (pedido desde Configuración)`);
+  submitLanJob(lanJobFromRecord(rec));
+  return { status: 202, body: { ok: true, status: "accepted" } };
+}
+
+async function startLanServer() {
+  if (!lanEnabled) {
+    log(cfg.mode === "device"
+      ? "lan: desactivado por config (disable_lan_server)"
+      : "lan: desactivado en modo legacy (service role) — re-pareá con: print-bridge pair <CODIGO>");
+    return;
+  }
+  if (!lanStore) return;
+  lanStore.compact();
+  const server = createLanServer({
+    version: VERSION,
+    allowedOrigins: buildAllowedOrigins({
+      appOrigin: cfg.appOrigin,
+      extra: cfg.allowedOrigins,
+      dev: VERSION === "dev",
+    }),
+    verify: verifyLanRequestToken,
+    hello: lanHello,
+    print: lanPrint,
+    retry: lanRetry,
+    log,
+  });
+  try {
+    lanPort = await server.listen(cfg.lanPort);
+  } catch (e) {
+    log(`lan: no se pudo abrir el puerto ${cfg.lanPort} (${e.code ?? e.message}) — impresión por red local desactivada`);
+    return;
+  }
+  const addrs = lanAddresses();
+  log(`lan: escuchando en ${addrs.length ? addrs.map((a) => `${a}:${lanPort}`).join(", ") : `puerto ${lanPort} (sin red)`}`);
+  if (lanSecrets.size === 0) log("lan: aún sin claves — se descargan al conectar con la nube");
+  setInterval(() => lanStore.compact(), 24 * 60 * 60_000);
+  process.on("SIGINT", () => { void server.close(); });
+  resumeLanQueue();
+}
+
+/** Fetch this device's LAN token keys (one per pairing row) and persist them,
+ *  so tokens verify on an offline boot too. */
+async function refreshLanSecrets() {
+  if (!lanEnabled) return;
+  const { data, error } = await supabase.rpc("bridge_lan_secrets");
+  if (error) {
+    // Migration 277 not applied yet, or a blip: tokens keep verifying with
+    // the persisted keys, and the next refresh tries again.
+    log(`lan: no se pudieron leer las claves (${error.message})`);
+    return;
+  }
+  const list = (Array.isArray(data) ? data : []).map((r) => ({
+    bridge_token_id: r.bridge_token_id,
+    restaurant_id: r.restaurant_id,
+    lan_secret: r.lan_secret,
+  }));
+  lanSecrets = new Map(parseLanSecrets(list).map((x) => [x.bridgeTokenId, x]));
+  updateConfigRaw((raw) => {
+    if (JSON.stringify(raw.lan_secrets ?? null) === JSON.stringify(list)) return false;
+    raw.lan_secrets = list;
+    return true;
+  });
+}
+
+/** Cloud-side LAN chores, once signed in. Never throws. */
+async function lanAfterSignIn(userId) {
+  if (!lanEnabled) return;
+  updateConfigRaw((raw) => {
+    if (raw.device_user_id === userId) return false;
+    raw.device_user_id = userId;
+    return true;
+  });
+  await refreshLanSecrets();
+  setInterval(() => { void refreshLanSecrets(); }, 30 * 60_000);
+  if (lanPort !== null && !lanEndpoints) {
+    lanEndpoints = startLanEndpointsReporter({
+      supabase,
+      log,
+      port: lanPort,
+      version: VERSION,
+      deviceId: () => DEVICE_ID,
+    });
+  }
+  await flushJournalAcks();
+  setInterval(() => { void flushJournalAcks(); }, 60_000);
 }
 
 // Stuck-claim reaper (0.6.8). A job can be left in_progress with nobody
@@ -445,9 +879,26 @@ function schedulePrintersRefresh() {
 
 async function main() {
   log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, mode=${cfg.mode}, restaurants=${cfg.restaurantIds.join(", ")})`);
+  // Self-update runs in BOTH auth modes — it's what carries legacy installs
+  // forward too. Applies only between prints, never mid-ticket (LAN tickets
+  // included: they share inFlight, and queued ones survive the restart).
+  // Started before sign-in so a bridge stuck signing in can still update.
+  const selfUpdate = startSelfUpdate({
+    log,
+    isBusy: () => inFlight.size > 0,
+    repo: cfg.updateRepo,
+    disabled: cfg.disableAutoUpdate,
+  });
+  process.on("SIGINT", () => selfUpdate.stop());
+
   if (cfg.mode === "device") {
+    // Offline-first boot (0.7.0): cached printers + the LAN server come up
+    // before the sign-in, which retries forever without internet.
+    if (lanEnabled) restorePrintersFromCache();
+    await startLanServer();
     const userId = await signInDevice();
     DEVICE_ID = `bridge:${userId}`;
+    cloudReady = true;
     log(`signed in as device ${userId}`);
     // If the session ever dies (refresh failed after a long offline stretch),
     // sign in again — the queries below would otherwise 401 forever. Guarded:
@@ -458,18 +909,14 @@ async function main() {
       reauthing = true;
       void signInDevice().then(() => { reauthing = false; });
     });
+    await reloadPrinters();
+    await claimPrinters();
+    await lanAfterSignIn(userId);
+  } else {
+    await startLanServer(); // logs why it's off in legacy mode
+    await reloadPrinters();
+    await claimPrinters();
   }
-  await reloadPrinters();
-  await claimPrinters();
-  // Self-update runs in BOTH auth modes — it's what carries legacy installs
-  // forward too. Applies only between prints, never mid-ticket.
-  const selfUpdate = startSelfUpdate({
-    log,
-    isBusy: () => inFlight.size > 0,
-    repo: cfg.updateRepo,
-    disabled: cfg.disableAutoUpdate,
-  });
-  process.on("SIGINT", () => selfUpdate.stop());
 
   if (cfg.mode === "device" && !cfg.disableDiscovery) {
     discovery = startDiscovery({ supabase, log, label: cfg.label, version: VERSION });
@@ -522,12 +969,19 @@ async function main() {
 
   // Reset any in_progress jobs that belong to us but predate this process —
   // they were probably interrupted by a crash/restart. Mark them pending so
-  // we'll retry them.
-  await supabase
+  // we'll retry them. Rows this bridge already printed (journaled, ack still
+  // pending) are left alone: lanAfterSignIn acked them above, and any that
+  // failed to ack are acked — not printed — when the poll sees them.
+  const journaledUnacked = lanStore?.unackedCloudKeys() ?? [];
+  let resetQuery = supabase
     .from("print_jobs")
     .update({ status: "pending", claimed_at: null })
     .eq("status", "in_progress")
     .in("printer_id", Array.from(printers.keys()));
+  if (journaledUnacked.length > 0 && journaledUnacked.length <= 100) {
+    resetQuery = resetQuery.not("id", "in", `(${journaledUnacked.join(",")})`);
+  }
+  await resetQuery;
 
   if (cfg.pollIntervalMs) {
     log(`poll: fixed every ${cfg.pollIntervalMs / 1000}s (poll_interval_ms)`);
@@ -562,6 +1016,7 @@ async function main() {
   process.on("SIGINT", async () => {
     log("shutting down…");
     discovery?.stop();
+    lanEndpoints?.stop();
     for (const channel of channels) {
       try { await supabase.removeChannel(channel); } catch {}
     }

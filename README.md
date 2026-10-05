@@ -273,7 +273,9 @@ journalctl -u fujun-bridge -f   # follow logs
 | `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. |
 | Jobs queue but never print | Bridge isn't running, or printer is `is_active=false` in the DB. |
 | Windows: jobs queue for hours, then everything prints the moment you press **Enter** in the bridge window (`CHANNEL_ERROR` → `SUBSCRIBED`) | Someone clicked inside the console: QuickEdit "Select" mode blocks every console write, which freezes the whole process. 0.5.3+ turns QuickEdit off on its own console at start. On older builds: right-click the title bar → *Propiedades* → untick *Modo de edición rápida*, or `reg add HKCU\Console /v QuickEdit /t REG_DWORD /d 0 /f`. |
-| App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Downloads never auto-update: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
+| App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Builds ≥ 0.5.0 self-update within ~6 h of a release (see Self-update below); older ones don't: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
+| `lan: no se pudo abrir el puerto 7373 (EADDRINUSE)` | Another bridge process (or a second copy run by hand) already holds the port. End every `print-bridge` process and start one. Printing through the cloud keeps working either way. |
+| Impresoras page: «No responde desde este dispositivo» | The tablet can't reach the PC on port 7373: different network / guest WiFi with client isolation, or the Windows firewall. Re-run the installer as administrator (adds the rule), or allow it in *Firewall de Windows Defender → Permitir una aplicación*. Check from the tablet's browser: `http://<pc-ip>:7373/` must say «red local OK». |
 | macOS: "cannot be opened because the developer cannot be verified" | `xattr -d com.apple.quarantine print-bridge-macos-arm64`, then run again. |
 
 ---
@@ -396,6 +398,12 @@ the "done" acknowledgement so a printed ticket is not re-queued and printed
 twice. The log shows `reaper: re-queued N stuck job(s)` when it recovers
 something.
 
+**0.6.9 — fiado receipts carry a signature line.** A recibo settled on
+crédito prints `Cuenta por cobrar a: <cliente>` as its `FORMA DE PAGO` row
+and, under it, a line for the customer's signature with `Firma del cliente`
+and the name. Older bridges print the row (the label travels in the payload)
+but not the signature line.
+
 **0.6.2 — no more blank paper below the rule.** 0.6.0 held the socket for
 only `bytes / 32` ms (a 35 KB comanda: 1.1 s). A module that feeds the
 printer over a serial link drains nearer 6–11 bytes/ms, so it had forwarded
@@ -430,6 +438,44 @@ Config escape hatches: `"disable_auto_update": true` turns it off;
 `"update_repo": "owner/repo"` points a test PC at a fork's releases.
 Bridges run from source (`node src/index.mjs`) never self-update.
 
+## LAN print server (0.7.0)
+
+The bridge also listens on the restaurant network (`0.0.0.0:7373`,
+`lan-server.mjs`) so the app's tablets and PCs can hand it tickets
+directly — LAN-first while online, and the only way to reach the WiFi /
+USB-bridge printers while the internet is down. Chrome / Edge 142+ allow
+an HTTPS page to call `http://<private IP>:7373` after a one-time "red
+local" permission (the app's **Permitir** pill asks for it); Safari and
+Firefox keep printing through the cloud.
+
+- **Offline boot.** Every successful printer reload is cached in
+  `~/.fujun-bridge/cache/printers.json`; the bridge starts the LAN server
+  from it BEFORE signing in, so a PC that boots without internet still
+  prints what tablets send.
+- **Auth.** Every print carries a LAN token the app signed for a staff
+  member (`lan-token.mjs`, HMAC with the pairing's `bridge_tokens.lan_secret`,
+  migration 277). The bridge verifies it offline with the keys it keeps in
+  `config.json` (`lan_secrets`, refreshed from `bridge_lan_secrets()` on
+  every online start). Guests on the WiFi can't print.
+- **Two kinds of LAN ticket.** `source: "offline"` = an order created
+  without internet: the bridge answers `202 accepted` only once the payload
+  is fsynced to `~/.fujun-bridge/lan/jobs/`, retries up to 5 times
+  (5 s → 2 min), and parks it as failed for a manual **Reimprimir** from the
+  app. `source: "cloud"` = a print_jobs row the app just inserted: the
+  bridge claims the cloud row atomically before printing (realtime/poll
+  can't print it twice), or prints it "blind" when its own internet is down
+  and acks it from `lan/journal.jsonl` when the cloud is back.
+- **Addresses.** The bridge reports its IPv4 addresses + port with
+  `bridge_report_lan_endpoints` (at sign-in, on change, every 30 min).
+- **Config.** `"lan_port": 7373`, `"disable_lan_server": true`,
+  `"allowed_origins": ["http://localhost:3000"]` (dev). CORS answers only
+  the app's origins (`app_origin` from `pair`, andescocina.com,
+  `*.vercel.app`).
+- **Firewall.** `install.ps1` run as administrator adds an inbound rule for
+  the binary on every profile (restaurant WiFi is usually "Public"); without
+  it, accept Windows' "Permitir acceso" alert. Human check from any device on
+  the network: `http://<pc-ip>:7373/` → «Fujun Print Bridge vX — red local OK».
+
 ## Printer discovery (0.4.0)
 
 In device mode the bridge periodically scans its local subnets for printers
@@ -438,10 +484,12 @@ answering on TCP:9100 and enumerates the PC's installed spooler printers
 `bridge_report_discoveries`, migration 201). The app uses them to prefill
 the WiFi printer form, suggest a one-click fix when a printer's DHCP
 address changes, and offer a dropdown of exact spooler names. Scans run at
-startup, every 15 minutes, and (debounced) after a wifi print fails with a
-connection error. The scan is light: ≤32 concurrent connection probes,
-port 9100 only, /24 max per interface, done in a few seconds. Legacy
-service-role configs don't report (no device identity to attach it to).
+startup, every 6 hours, and (debounced, at most once per 15 min) after a
+wifi print fails with a connection error. The scan is deliberately gentle
+since 0.4.1 (a router's port-scan protection throttled a whole LAN at 32
+probes): 4 concurrent probes with 150 ms gaps, port 9100 only, /24 max per
+interface. Legacy service-role configs don't report (no device identity to
+attach it to).
 
 ## Security note
 

@@ -59,6 +59,9 @@ function formatMoney(amount, currency, usdSymbol = "$", group = true) {
   return `${fixed} ${currency === "VES" ? "Bs" : "$"}`;
 }
 
+/** Caption under the signature line of a fiado receipt (0.6.9). */
+const SIGNATURE_LABEL = "Firma del cliente";
+
 function centerIn(s, width) {
   if (s.length >= width) return s.slice(0, width);
   const total = width - s.length;
@@ -598,6 +601,20 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
         const label = "Vuelto";
         const pad = Math.max(1, COLS - label.length - v.length);
         esc.line(label + " ".repeat(pad) + v);
+      }
+      // Fiado (0.6.9): the customer signs the copy the restaurant keeps as
+      // proof of the debt. Mirrors src/lib/printing/templates/kitchen-ticket.ts.
+      const credits = f.payments.filter((pay) => pay.credit);
+      if (credits.length > 0) {
+        esc.feed(2);
+        esc.align("center");
+        esc.line("_".repeat(Math.max(10, COLS - 8)));
+        esc.line(SIGNATURE_LABEL);
+        const signer = credits
+          .map((pay) => (pay.credit_customer_name || "").trim())
+          .find((n) => !!n);
+        if (signer) for (const ln of wrap(signer, COLS)) esc.line(ln);
+        esc.align("left");
       }
       plain();
     }

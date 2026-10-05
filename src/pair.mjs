@@ -78,6 +78,27 @@ export async function runPair(args) {
   }
   const body = await res.json();
 
+  // LAN print server (0.7.0): the app origin tablets call the LAN server from
+  // (CORS), and this pairing's HMAC secret for LAN tokens. Older app deploys
+  // don't send the secret — the bridge then fetches every secret it is owed
+  // through bridge_lan_secrets() on its first online start.
+  let appOrigin = null;
+  try {
+    appOrigin = new URL(url).origin;
+  } catch {}
+  const withLan = (cfg) => {
+    const out = { ...cfg, ...(appOrigin ? { app_origin: appOrigin } : {}) };
+    if (typeof body.lan_secret === "string" && body.lan_secret) {
+      const others = (Array.isArray(cfg.lan_secrets) ? cfg.lan_secrets : [])
+        .filter((x) => x?.bridge_token_id !== body.bridge_token_id);
+      out.lan_secrets = [
+        ...others,
+        { bridge_token_id: body.bridge_token_id, restaurant_id: body.restaurant_id, lan_secret: body.lan_secret },
+      ];
+    }
+    return out;
+  };
+
   let raw;
   if (existingAccessToken && existingIsDevice) {
     // Append the new restaurant to the existing device config.
@@ -85,19 +106,19 @@ export async function runPair(args) {
     if (!restaurants.some((r) => r?.id === body.restaurant_id)) {
       restaurants.push({ id: body.restaurant_id, bridge_token_id: body.bridge_token_id });
     }
-    raw = { ...existing, restaurants };
+    raw = withLan({ ...existing, restaurants });
   } else {
     if (existing && !existingIsDevice) {
       console.warn("Reemplazando config antigua (service role key). Si esta PC imprimía para otras sucursales, generá un código en cada una y repetí `pair`.");
     }
-    raw = {
+    raw = withLan({
       supabase_url: body.supabase_url,
       anon_key: body.anon_key,
       device_email: body.device_email,
       device_password: body.device_password,
       restaurants: [{ id: body.restaurant_id, bridge_token_id: body.bridge_token_id }],
       label,
-    };
+    });
   }
 
   const p = saveConfigRaw(raw);
