@@ -476,6 +476,51 @@ Firefox keep printing through the cloud.
   it, accept Windows' "Permitir acceso" alert. Human check from any device on
   the network: `http://<pc-ip>:7373/` → «Fujun Print Bridge vX — red local OK».
 
+## Offline hub: order relay, store-and-forward, ticket archive (0.8.0)
+
+0.8.0 turns the LAN server into the restaurant's meeting point while the
+internet is down. Every feature is advertised in the hello reply
+(`features: ["relay", "seq", "ops", "archive"]`); an app talking to an older
+bridge simply doesn't use them, and a 0.8.0 bridge talking to an older app
+behaves exactly like 0.7.x. All state lives under `~/.fujun-bridge/lan/`.
+
+- **Order relay** (`lan-relay.mjs`, `lan/relay/board.jsonl`). Devices push
+  the rows their offline work produced (orders, order_items — what the app
+  keeps in IndexedDB) with `POST /lan/v1/relay/push`, and long-poll
+  everybody else's with `POST /lan/v1/relay/pull` (`since` cursor, held up
+  to 8 s — under Bun's 10 s idle timeout). Rows merge last-writer-wins; each
+  order tracks which outbox operations still have to reach the cloud and is
+  **settled** once they all synced (devices ack with `/lan/v1/relay/ack`, or
+  the bridge uploaded them itself). Settled orders are purged after 1 h,
+  unsettled ones after 72 h. A wiped store gets a new `epoch` and devices
+  resync from 0. `in_cloud` tells devices when an order's create synced, so
+  a payment taken on another tablet never reaches the server first.
+- **Shared temporary numbers** (`POST /lan/v1/relay/seq`). One «T-NNN»
+  counter per restaurant and day for every tablet, so two offline orders
+  never both print as T-001.
+- **Store-and-forward** (`lan-ops.mjs` + `lan-upload.mjs`, `lan/ops/`).
+  A push may carry a signed copy of the operation (orders, payments, item
+  status, caja movements). The bridge fsyncs it before answering and, as
+  soon as it has a cloud session, posts it to the app
+  (`POST <app_origin>/api/public/bridge/ops`, Bearer = the device token).
+  The app checks the device signature — made with a key derived from a
+  server-only secret, which the bridge never sees, so it can neither forge
+  nor alter operations — and runs each one as the staff member who made
+  it, through the same server action and idempotency key as the tablet's
+  own replay. Results: synced / retry (backoff 5 s → 1 h) / failed / skip
+  (the tablet syncs it itself). Gives up after 72 h. An app without the
+  route answers 404 and the bridge waits an hour before asking again.
+- **Ticket archive** (`lan-archive.mjs`, `lan/archive/<day>.jsonl`). Every
+  ticket the bridge prints (cloud, LAN-first, offline, reprints — not test
+  pages) is kept for today and yesterday (PC local date), payload not
+  bytes. `POST /lan/v1/tickets` lists them (newest first, filter by
+  `order_id` / kinds); `POST /lan/v1/tickets/reprint` renders one again with
+  the «REIMPRESION» banner on the same or another printer of the restaurant
+  and answers printed / failed when the printer settles within 8 s. A day
+  file stops growing at 64 MB.
+- **Housekeeping.** Relay sweep every minute; board, ops and archive
+  compaction hourly and at boot.
+
 ## Printer discovery (0.4.0)
 
 In device mode the bridge periodically scans its local subnets for printers

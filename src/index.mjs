@@ -11,6 +11,13 @@
  * and the only way to reach these printers while the internet is down. The
  * bridge also boots without internet now, from a cached printer list.
  *
+ * 0.8.0 makes it the restaurant's offline hub: tablets relay their offline
+ * orders to each other through it (lan-relay.mjs — the KDS and the caja see
+ * an order taken on another tablet), hand it their signed operations so it
+ * uploads them as soon as it is online even if the tablet is off
+ * (lan-ops.mjs + lan-upload.mjs), and every printed ticket is kept for the
+ * day so any tablet can reprint it (lan-archive.mjs).
+ *
  * One process can drive many printers across one or more restaurants on the
  * same PC (e.g. a restaurant and its sucursal): run `pair` once per
  * restaurant — the same device account accumulates them.
@@ -42,6 +49,10 @@ import { createLanStore, LAN_MAX_ATTEMPTS, lanRetryDelayMs } from "./lan-journal
 import { peekLanTokenClaims, verifyLanToken } from "./lan-token.mjs";
 import { lanAddresses, startLanEndpointsReporter } from "./lan-endpoints.mjs";
 import { loadPrinterCache, savePrinterCache } from "./printer-cache.mjs";
+import { createRelayBoard } from "./lan-relay.mjs";
+import { createOpsStore } from "./lan-ops.mjs";
+import { createOpsUploader } from "./lan-upload.mjs";
+import { createTicketArchive } from "./lan-archive.mjs";
 import crypto from "node:crypto";
 import path from "node:path";
 
@@ -126,6 +137,32 @@ if (lanEnabled) {
     console.error(`LAN: no se pudo abrir ${path.join(STATE_DIR, "lan")} (${e.message}) — impresión por red local desactivada`);
   }
 }
+// 0.8.0 stores. Each is independent: a broken one switches off only its own
+// feature (hello stops advertising it), never printing.
+let relayBoard = null;
+let opsStore = null;
+let archive = null;
+let uploader = null;
+if (lanStore) {
+  try {
+    relayBoard = createRelayBoard({ dir: path.join(STATE_DIR, "lan", "relay"), log });
+  } catch (e) {
+    console.error(`LAN: tablero de pedidos desactivado (${e.message})`);
+  }
+  try {
+    opsStore = createOpsStore({ dir: path.join(STATE_DIR, "lan", "ops"), log });
+  } catch (e) {
+    console.error(`LAN: subida de operaciones desactivada (${e.message})`);
+  }
+  try {
+    archive = createTicketArchive({ dir: path.join(STATE_DIR, "lan", "archive"), log });
+  } catch (e) {
+    console.error(`LAN: archivo de tickets desactivado (${e.message})`);
+  }
+}
+// Where the store-and-forward uploader posts (configs paired before 0.7.0
+// have no app_origin).
+const DEFAULT_APP_ORIGIN = "https://andescocina.com";
 // bridge_tokens.id -> { bridgeTokenId, restaurantId, secret } (LAN token keys)
 let lanSecrets = new Map((cfg.lanSecrets ?? []).map((x) => [x.bridgeTokenId, x]));
 let lanPort = null; // set once the LAN server is listening
@@ -385,6 +422,7 @@ async function runJob(job, printer) {
   const lan = job.lan ?? null;
   let claimed = false;
   let blind = false;
+  let claimedOrderId = null;
   try {
     if (lan && !(await hasCloudSession())) {
       blind = true;
@@ -398,7 +436,9 @@ async function runJob(job, printer) {
       // A LAN request names the row; pin it to what the token and the
       // request vouch for, so a mismatch reads as "not mine" (0 rows).
       if (lan) claim = claim.eq("restaurant_id", job.restaurant_id).eq("printer_id", job.printer_id).eq("kind", job.kind);
-      const claimQuery = claim.select("id").maybeSingle();
+      // order_id rides along for the reprint archive (LAN-forwarded rows
+      // don't carry it).
+      const claimQuery = claim.select("id, order_id").maybeSingle();
       const { data: claimedRow, error: claimErr } = lan
         ? await within(claimQuery, 4_000, { data: null, error: { message: "timeout" } })
         : await claimQuery;
@@ -414,12 +454,14 @@ async function runJob(job, printer) {
         return "skipped";
       } else {
         claimed = true;
+        claimedOrderId = claimedRow.order_id ?? null;
       }
     }
 
     log(`printing job ${job.id} → ${printer.name} (${printer.transport})${lan ? " [red local]" : ""}${blind ? " [sin nube]" : ""}`);
     const bytes = renderJob(job, printer);
     await sendToPrinter(printer, bytes);
+    archiveTicket({ ...job, order_id: job.order_id ?? claimedOrderId }, printer, lan ? "lan" : "cloud");
     if (blind) {
       lanStore?.markPrinted(job.id, { src: "cloud", pid: job.printer_id, kind: job.kind, acked: false });
       log(`ok job ${job.id} (${bytes.length} bytes, se confirma al volver la conexión)`);
@@ -495,6 +537,7 @@ async function runOfflineLanJob(job, printer) {
     log(`printing LAN job ${job.id} → ${printer.name} (${printer.transport}, pedido sin conexión)`);
     const bytes = renderJob(job, printer);
     await sendToPrinter(printer, bytes);
+    archiveTicket(job, printer, "offline");
     lanStore.markPrinted(job.id, { src: "offline", pid: job.printer_id, kind: job.kind, acked: true });
     log(`ok LAN job ${job.id} (${bytes.length} bytes)`);
     return "printed";
@@ -520,11 +563,29 @@ function lanJobFromRecord(rec) {
     id: rec.job_key,
     restaurant_id: rec.restaurant_id,
     printer_id: rec.printer_id,
+    order_id: rec.order_id ?? null,
     kind: rec.kind,
     payload: rec.payload,
     status: "pending",
     lan: { source: "offline" },
   };
+}
+
+/** Keep a printed ticket in the day's archive (0.8.0). Never throws. */
+function archiveTicket(job, printer, source, extra = {}) {
+  if (!archive || job.kind === "test") return;
+  archive.record({
+    id: job.id,
+    r: job.restaurant_id ?? printer.restaurant_id,
+    kind: job.kind,
+    printer_id: job.printer_id,
+    printer_name: printer.name,
+    order_id: job.order_id ?? null,
+    payload: job.payload,
+    source,
+    reprint_of: extra.reprintOf ?? null,
+    user_id: extra.userId ?? null,
+  });
 }
 
 function submitLanJob(job) {
@@ -612,6 +673,10 @@ function lanHello(claims) {
     error: j.last_error ?? null,
     at: j.failed_at ? new Date(j.failed_at).toISOString() : null,
   }));
+  const features = [];
+  if (relayBoard) features.push("relay", "seq");
+  if (relayBoard && opsStore) features.push("ops");
+  if (archive) features.push("archive");
   return {
     device_id: DEVICE_ID,
     now: new Date().toISOString(),
@@ -619,6 +684,12 @@ function lanHello(claims) {
     cloud: cloudReady,
     printers: list,
     failed,
+    // 0.8.0 — what the app may use on this bridge, and how much offline work
+    // it holds for this restaurant.
+    features,
+    ...(relayBoard ? { relay: relayBoard.stats(claims.r) } : {}),
+    ...(opsStore ? { ops: opsStore.stats(claims.r) } : {}),
+    ...(archive ? { archive: { today: archive.countToday(claims.r) } } : {}),
   };
 }
 
@@ -647,6 +718,7 @@ function lanPrint(claims, job) {
         printer_id: job.printer_id,
         kind: job.kind,
         payload: job.payload,
+        order_id: job.order_id ?? null,
         user_id: claims.u,
         accepted_at: Date.now(),
         attempts: 0,
@@ -663,6 +735,7 @@ function lanPrint(claims, job) {
     id: job.job_key,
     restaurant_id: claims.r,
     printer_id: job.printer_id,
+    order_id: job.order_id ?? null,
     kind: job.kind,
     payload: job.payload,
     status: "pending",
@@ -679,6 +752,117 @@ function lanRetry(claims, key) {
   log(`lan: reimprimiendo ${key} (pedido desde Configuración)`);
   submitLanJob(lanJobFromRecord(rec));
   return { status: 202, body: { ok: true, status: "accepted" } };
+}
+
+// ── 0.8.0: relay board, store-and-forward, ticket archive ───────────────
+
+const NOT_FOUND = { status: 404, body: { ok: false, error: "not_found" } };
+
+function relayPush(claims, push) {
+  if (!relayBoard) return NOT_FOUND;
+  let op = "none";
+  if (push.envelope && opsStore) {
+    // A token for restaurant A must not queue operations for restaurant B.
+    if (push.envelope.restaurant_id !== claims.r) {
+      return { status: 400, body: { ok: false, error: "envelope_restaurant" } };
+    }
+    if (relayBoard.isResolved(push.envelope.key)) {
+      op = "known";
+    } else {
+      try {
+        op = opsStore.add(claims.r, push.envelope);
+      } catch (e) {
+        log(`ops: no se pudo guardar ${push.envelope.key} (${e.message})`);
+        return { status: 503, body: { ok: false, error: "disk" } };
+      }
+      if (op === "queued") uploader?.kick();
+    }
+  }
+  const { v } = relayBoard.push(claims.r, push);
+  return { status: 200, body: { ok: true, v, epoch: relayBoard.epoch, op } };
+}
+
+async function relayPull(claims, pull, signal) {
+  if (!relayBoard) return NOT_FOUND;
+  const current = relayBoard.version(claims.r);
+  // Another board's cursor (store wiped, new PC) or one from the future:
+  // the device starts over from 0.
+  if ((pull.epoch && pull.epoch !== relayBoard.epoch) || pull.since > current) {
+    return { status: 200, body: { ok: true, reset: true, epoch: relayBoard.epoch, ...relayBoard.pull(claims.r, 0) } };
+  }
+  if (current <= pull.since && pull.wait_ms > 0) {
+    await relayBoard.waitForChange(claims.r, pull.since, pull.wait_ms, signal);
+  }
+  return { status: 200, body: { ok: true, epoch: relayBoard.epoch, ...relayBoard.pull(claims.r, pull.since) } };
+}
+
+function relayAck(claims, ack) {
+  if (!relayBoard) return NOT_FOUND;
+  if (opsStore) {
+    for (const [list, how] of [[ack.synced, "synced"], [ack.dropped, "dropped"], [ack.failed, "failed"]]) {
+      for (const key of list) {
+        if (opsStore.get(key)?.r === claims.r) opsStore.markDevice(key, how);
+      }
+    }
+  }
+  relayBoard.ack(claims.r, { synced: ack.synced, dropped: ack.dropped });
+  return { status: 200, body: { ok: true } };
+}
+
+function relaySeq(claims, seq) {
+  if (!relayBoard) return NOT_FOUND;
+  return { status: 200, body: { ok: true, n: relayBoard.nextSeq(claims.r, seq.day, seq.min) } };
+}
+
+function ticketsList(claims, q) {
+  if (!archive) return NOT_FOUND;
+  const tickets = archive.list(claims.r, { orderId: q.order_id, sinceMs: q.since_ms, limit: q.limit, kinds: q.kinds });
+  return { status: 200, body: { ok: true, tickets } };
+}
+
+/**
+ * Print an archived ticket again, with the «REIMPRESION» banner. Answers
+ * printed / failed when the printer settles within a few seconds (the
+ * person is waiting at the screen), else accepted.
+ */
+async function ticketReprint(claims, req) {
+  if (!archive) return NOT_FOUND;
+  const rec = archive.get(req.id);
+  if (!rec || rec.r !== claims.r) return { status: 404, body: { ok: false, error: "unknown_ticket" } };
+  const printerId = req.printer_id ?? rec.printer_id;
+  const printer = printers.get(printerId);
+  if (!printer || printer.restaurant_id !== claims.r) return { status: 404, body: { ok: false, error: "unknown_printer" } };
+  const payload = rec.payload && typeof rec.payload === "object" ? rec.payload : {};
+  const job = {
+    id: `reprint-${crypto.randomUUID()}`,
+    restaurant_id: claims.r,
+    printer_id: printerId,
+    order_id: rec.order_id ?? null,
+    kind: rec.kind,
+    payload: { ...payload, meta: { ...(payload.meta ?? {}), reprint: true } },
+  };
+  inFlight.add(job.id);
+  const run = serialized(printerId, async () => {
+    const bytes = renderJob(job, printer);
+    await sendToPrinter(printer, bytes);
+    archiveTicket(job, printer, "reprint", { reprintOf: rec.id, userId: claims.u });
+    log(`lan: reimpresión de ${rec.kind} → ${printer.name} (${rec.order_number ?? rec.label ?? rec.id.slice(0, 8)})`);
+  }).finally(() => inFlight.delete(job.id));
+  const outcome = await within(
+    run.then(
+      () => "printed",
+      (e) => {
+        log(`lan: falló la reimpresión → ${printer.name}: ${e.message}`);
+        noteSendFailure(printer, e);
+        return { error: e.message };
+      },
+    ),
+    8_000,
+    "accepted",
+  );
+  if (outcome === "printed") return { status: 200, body: { ok: true, status: "printed" } };
+  if (outcome === "accepted") return { status: 202, body: { ok: true, status: "accepted" } };
+  return { status: 200, body: { ok: false, status: "failed", error: outcome.error } };
 }
 
 async function startLanServer() {
@@ -701,6 +885,8 @@ async function startLanServer() {
     hello: lanHello,
     print: lanPrint,
     retry: lanRetry,
+    ...(relayBoard ? { relayPush, relayPull, relayAck, relaySeq } : {}),
+    ...(archive ? { ticketsList, ticketReprint } : {}),
     log,
   });
   try {
@@ -713,6 +899,17 @@ async function startLanServer() {
   log(`lan: escuchando en ${addrs.length ? addrs.map((a) => `${a}:${lanPort}`).join(", ") : `puerto ${lanPort} (sin red)`}`);
   if (lanSecrets.size === 0) log("lan: aún sin claves — se descargan al conectar con la nube");
   setInterval(() => lanStore.compact(), 24 * 60 * 60_000);
+  // 0.8.0 housekeeping: purge settled relay orders every minute, rewrite the
+  // append-only files hourly.
+  relayBoard?.sweep();
+  relayBoard?.compact();
+  opsStore?.compact();
+  setInterval(() => relayBoard?.sweep(), 60_000);
+  setInterval(() => {
+    relayBoard?.compact();
+    opsStore?.compact();
+    archive?.compact();
+  }, 60 * 60_000);
   process.on("SIGINT", () => { void server.close(); });
   resumeLanQueue();
 }
@@ -762,6 +959,23 @@ async function lanAfterSignIn(userId) {
   }
   await flushJournalAcks();
   setInterval(() => { void flushJournalAcks(); }, 60_000);
+  // Store-and-forward (0.8.0): operations devices left here go up now.
+  if (opsStore && !uploader) {
+    uploader = createOpsUploader({
+      store: opsStore,
+      onSynced: (key) => relayBoard?.opSynced(key),
+      getAccessToken: async () => {
+        const { data } = await supabase.auth.getSession();
+        return data?.session?.access_token ?? null;
+      },
+      appOrigin: cfg.appOrigin || DEFAULT_APP_ORIGIN,
+      version: VERSION,
+      log,
+    });
+    uploader.start();
+    const { queued } = opsStore.stats();
+    if (queued > 0) log(`ops: ${queued} operación(es) de las tablets por subir`);
+  }
 }
 
 // Stuck-claim reaper (0.6.8). A job can be left in_progress with nobody
@@ -1017,6 +1231,7 @@ async function main() {
     log("shutting down…");
     discovery?.stop();
     lanEndpoints?.stop();
+    uploader?.stop();
     for (const channel of channels) {
       try { await supabase.removeChannel(channel); } catch {}
     }
