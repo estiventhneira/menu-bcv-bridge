@@ -15,6 +15,9 @@
 //   u   auth user id of the staff member (logged by the bridge)
 //   iat issued at, epoch seconds
 //   exp expiry, epoch seconds
+//   p   (0.9.0, optional) scopes beyond printing — "fiscal_admin" (connect /
+//       test the máquina fiscal) and "fiscal_report" (Reporte X). Older
+//       bridges ignore it; a token without it can still print and relay.
 //
 // PC clocks drift (field data: seconds to minutes, occasionally days after a
 // dead CMOS battery), so verification allows a skew window on both ends.
@@ -28,6 +31,8 @@ export const LAN_TOKEN_TTL_MS = 7 * 24 * 60 * 60_000;
 export const LAN_TOKEN_SKEW_MS = 24 * 60 * 60_000;
 /** Sanity cap on exp - iat: a longer-lived token was not minted by us. */
 const MAX_LIFETIME_S = 31 * 24 * 60 * 60;
+/** Scopes a token may carry (claim `p`). */
+export const LAN_TOKEN_SCOPES = new Set(["fiscal_admin", "fiscal_report"]);
 
 function mac(secret, signed) {
   return crypto.createHmac("sha256", secret).update(signed).digest("base64url");
@@ -48,15 +53,22 @@ export function signLanToken(secret, claims) {
 }
 
 /** Claims for a fresh token, valid LAN_TOKEN_TTL_MS from `nowMs`. */
-export function newLanTokenClaims({ bridgeTokenId, restaurantId, userId, nowMs = Date.now() }) {
+export function newLanTokenClaims({ bridgeTokenId, restaurantId, userId, nowMs = Date.now(), scopes = [] }) {
   const iat = Math.floor(nowMs / 1000);
+  const p = [...new Set(scopes)].filter((s) => LAN_TOKEN_SCOPES.has(s)).sort();
   return {
     t: bridgeTokenId,
     r: restaurantId,
     u: userId,
     iat,
     exp: iat + Math.floor(LAN_TOKEN_TTL_MS / 1000),
+    ...(p.length ? { p } : {}),
   };
+}
+
+/** Does a verified token carry `scope`? */
+export function lanTokenHasScope(claims, scope) {
+  return !!claims && Array.isArray(claims.p) && claims.p.includes(scope);
 }
 
 function isClaims(c) {
@@ -69,7 +81,8 @@ function isClaims(c) {
     Number.isFinite(c.iat) &&
     Number.isFinite(c.exp) &&
     c.exp > c.iat &&
-    c.exp - c.iat <= MAX_LIFETIME_S
+    c.exp - c.iat <= MAX_LIFETIME_S &&
+    (c.p === undefined || (Array.isArray(c.p) && c.p.length <= 8 && c.p.every((s) => typeof s === "string" && s.length <= 32)))
   );
 }
 

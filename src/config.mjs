@@ -19,7 +19,10 @@
 //        "disable_lan_server": false,
 //        "app_origin":       "https://andescocina.com",   // written by `pair`
 //        "allowed_origins":  ["http://localhost:3000"],   // extra CORS origins
-//        "device_user_id":   "<uuid>"          // written after the first sign-in
+//        "device_user_id":   "<uuid>",         // written after the first sign-in
+//        // Máquina fiscal host (0.9.0) — written by «Conectar máquina»:
+//        "fiscal_machines":  [{ "restaurant_id", "port": "COM3", "registro",
+//                               "rif", "model", "connected_at" }]
 //      }
 //    plus "lan_secrets": [{ bridge_token_id, restaurant_id, lan_secret }] —
 //    the HMAC keys for LAN tokens, written by `pair` and replaced from
@@ -152,6 +155,8 @@ export function loadConfig() {
     allowedOrigins: Array.isArray(raw.allowed_origins)
       ? raw.allowed_origins.filter((o) => typeof o === "string")
       : [],
+    // Máquina fiscal host (0.9.0): validated by fiscal-host.mjs.
+    fiscalMachines: Array.isArray(raw.fiscal_machines) ? raw.fiscal_machines : [],
   };
 
   // Device shape (0.3.0+)

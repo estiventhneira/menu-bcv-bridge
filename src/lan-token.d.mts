@@ -12,7 +12,13 @@ export interface LanTokenClaims {
   iat: number;
   /** Expiry, epoch seconds. */
   exp: number;
+  /** Scopes beyond printing (0.9.0): "fiscal_admin", "fiscal_report". */
+  p?: string[];
 }
+
+export type LanTokenScope = "fiscal_admin" | "fiscal_report";
+export const LAN_TOKEN_SCOPES: Set<LanTokenScope>;
+export function lanTokenHasScope(claims: LanTokenClaims | null | undefined, scope: LanTokenScope): boolean;
 
 export const LAN_TOKEN_VERSION: "v1";
 export const LAN_TOKEN_TTL_MS: number;
@@ -24,6 +30,7 @@ export function newLanTokenClaims(args: {
   restaurantId: string;
   userId: string;
   nowMs?: number;
+  scopes?: readonly LanTokenScope[];
 }): LanTokenClaims;
 export function peekLanTokenClaims(token: unknown): LanTokenClaims | null;
 export function verifyLanToken(

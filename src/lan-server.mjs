@@ -26,6 +26,20 @@
 //   POST /lan/v1/relay/seq      shared temporary order number for the day
 //   POST /lan/v1/tickets        printed-ticket archive (today + yesterday)
 //   POST /lan/v1/tickets/reprint  print an archived ticket again
+//
+// 0.9.0 — máquina fiscal host (fiscal/fiscal-host.mjs; same 404-when-absent
+// rule, hello lists "fiscal"). Who may call what is index.mjs's job: a
+// factura needs a server-signed plan, setup and reports need the token's
+// fiscal_admin / fiscal_report scope.
+//   POST /lan/v1/fiscal/status      machines, unrecorded results ({ live })
+//   POST /lan/v1/fiscal/invoice     { plan } — print a factura
+//   POST /lan/v1/fiscal/job         { job } — poll a factura job
+//   POST /lan/v1/fiscal/ack         { receipt } — results recorded
+//   POST /lan/v1/fiscal/ports       serial ports on this PC
+//   POST /lan/v1/fiscal/connect     { port, registro, rif, save } — probe/save
+//   POST /lan/v1/fiscal/disconnect  { registro }
+//   POST /lan/v1/fiscal/test        { registro, lines? } — documento no fiscal
+//   POST /lan/v1/fiscal/report-x    { registro } — Reporte X
 
 import http from "node:http";
 import { LAN_JOB_KEY_RE } from "./lan-journal.mjs";
@@ -271,6 +285,66 @@ export function validateTicketReprint(body) {
   return { ok: true, reprint: { id: body.id, printer_id: printerId } };
 }
 
+// ── 0.9.0 validators (máquina fiscal) ───────────────────────────────────
+
+const FISCAL_REGISTRO_RE = /^[A-Za-z0-9]{3,16}$/;
+const FISCAL_TOKEN_MAX = LAN_BODY_LIMIT_BYTES - 1024;
+
+/** @returns {{ ok: true, req: { live: boolean } } | { ok: false, error: string }} */
+export function validateFiscalStatus(body) {
+  if (!isPlainObject(body)) return { ok: false, error: "body" };
+  return { ok: true, req: { live: body.live === true } };
+}
+
+/** @returns {{ ok: true, req: { plan: string } } | { ok: false, error: string }} */
+export function validateFiscalInvoice(body) {
+  if (!isPlainObject(body) || typeof body.plan !== "string" || body.plan.length < 20 || body.plan.length > FISCAL_TOKEN_MAX) {
+    return { ok: false, error: "plan" };
+  }
+  return { ok: true, req: { plan: body.plan } };
+}
+
+/** @returns {{ ok: true, req: { job: string } } | { ok: false, error: string }} */
+export function validateFiscalJob(body) {
+  if (!isPlainObject(body) || typeof body.job !== "string" || !UUID_RE.test(body.job)) return { ok: false, error: "job" };
+  return { ok: true, req: { job: body.job } };
+}
+
+/** @returns {{ ok: true, req: { receipt: string } } | { ok: false, error: string }} */
+export function validateFiscalAck(body) {
+  if (!isPlainObject(body) || typeof body.receipt !== "string" || body.receipt.length < 20 || body.receipt.length > 64 * 1024) {
+    return { ok: false, error: "receipt" };
+  }
+  return { ok: true, req: { receipt: body.receipt } };
+}
+
+/** @returns {{ ok: true, req: {} } | { ok: false, error: string }} */
+export function validateFiscalPorts(body) {
+  return isPlainObject(body) ? { ok: true, req: {} } : { ok: false, error: "body" };
+}
+
+/** @returns {{ ok: true, req: { port: string, registro: string, rif: string, save: boolean } } | { ok: false, error: string }} */
+export function validateFiscalConnect(body) {
+  if (!isPlainObject(body)) return { ok: false, error: "body" };
+  const { port, registro, rif } = body;
+  if (typeof port !== "string" || !port || port.length > 200 || /[\0-\x1f]/.test(port)) return { ok: false, error: "port" };
+  if (typeof registro !== "string" || !FISCAL_REGISTRO_RE.test(registro)) return { ok: false, error: "registro" };
+  if (typeof rif !== "string" || rif.length < 3 || rif.length > 20) return { ok: false, error: "rif" };
+  return { ok: true, req: { port, registro, rif, save: body.save === true } };
+}
+
+/** @returns {{ ok: true, req: { registro: string, lines: string[] } } | { ok: false, error: string }} */
+export function validateFiscalRegistro(body) {
+  if (!isPlainObject(body) || typeof body.registro !== "string" || !FISCAL_REGISTRO_RE.test(body.registro)) {
+    return { ok: false, error: "registro" };
+  }
+  const lines = body.lines ?? [];
+  if (!Array.isArray(lines) || lines.length > 8 || lines.some((l) => typeof l !== "string" || l.length > 80)) {
+    return { ok: false, error: "lines" };
+  }
+  return { ok: true, req: { registro: body.registro, lines } };
+}
+
 function bearer(req) {
   const h = req.headers.authorization;
   if (typeof h !== "string") return null;
@@ -285,6 +359,16 @@ const ROUTES_080 = {
   "/lan/v1/relay/seq": { dep: "relaySeq", validate: validateRelaySeq, field: "seq" },
   "/lan/v1/tickets": { dep: "ticketsList", validate: validateTicketsList, field: "query" },
   "/lan/v1/tickets/reprint": { dep: "ticketReprint", validate: validateTicketReprint, field: "reprint" },
+  // 0.9.0
+  "/lan/v1/fiscal/status": { dep: "fiscalStatus", validate: validateFiscalStatus, field: "req" },
+  "/lan/v1/fiscal/invoice": { dep: "fiscalInvoice", validate: validateFiscalInvoice, field: "req" },
+  "/lan/v1/fiscal/job": { dep: "fiscalJob", validate: validateFiscalJob, field: "req" },
+  "/lan/v1/fiscal/ack": { dep: "fiscalAck", validate: validateFiscalAck, field: "req" },
+  "/lan/v1/fiscal/ports": { dep: "fiscalPorts", validate: validateFiscalPorts, field: "req" },
+  "/lan/v1/fiscal/connect": { dep: "fiscalConnect", validate: validateFiscalConnect, field: "req" },
+  "/lan/v1/fiscal/disconnect": { dep: "fiscalDisconnect", validate: validateFiscalRegistro, field: "req" },
+  "/lan/v1/fiscal/test": { dep: "fiscalTest", validate: validateFiscalRegistro, field: "req" },
+  "/lan/v1/fiscal/report-x": { dep: "fiscalReportX", validate: validateFiscalRegistro, field: "req" },
 };
 
 /** @typedef {{ status: number, body: object }} Reply */
@@ -303,6 +387,15 @@ const ROUTES_080 = {
  *   relaySeq?: (claims: object, seq: object) => Promise<Reply> | Reply,
  *   ticketsList?: (claims: object, query: object) => Promise<Reply> | Reply,
  *   ticketReprint?: (claims: object, reprint: object) => Promise<Reply> | Reply,
+ *   fiscalStatus?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalInvoice?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalJob?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalAck?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalPorts?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalConnect?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalDisconnect?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalTest?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalReportX?: (claims: object, req: object) => Promise<Reply> | Reply,
  *   log?: (...a: unknown[]) => void,
  *   rate?: { windowMs: number, max: number },
  *   bodyLimit?: number,
@@ -465,7 +558,7 @@ export function createLanServer(deps) {
       return;
     }
 
-    // ── 0.8.0: relay, store-and-forward, archive ──────────────────────
+    // ── 0.8.0: relay, store-and-forward, archive · 0.9.0: fiscal ──────
     const route = Object.hasOwn(ROUTES_080, url) ? ROUTES_080[url] : null;
     if (route) {
       const handler = deps[route.dep];

@@ -18,6 +18,11 @@
  * (lan-ops.mjs + lan-upload.mjs), and every printed ticket is kept for the
  * day so any tablet can reprint it (lan-archive.mjs).
  *
+ * 0.9.0 hosts the restaurant's máquina fiscal (HKA / ACLAS PP9-PLUS) on
+ * its COM port: any staff device issues facturas through /lan/v1/fiscal/*
+ * with a plan the app server signed (fiscal/fiscal-host.mjs, design
+ * docs/plans/2026-10-07-fiscal-bridge-host-design.md).
+ *
  * One process can drive many printers across one or more restaurants on the
  * same PC (e.g. a restaurant and its sucursal): run `pair` once per
  * restaurant — the same device account accumulates them.
@@ -53,6 +58,12 @@ import { createRelayBoard } from "./lan-relay.mjs";
 import { createOpsStore } from "./lan-ops.mjs";
 import { createOpsUploader } from "./lan-upload.mjs";
 import { createTicketArchive } from "./lan-archive.mjs";
+import { lanTokenHasScope } from "./lan-token.mjs";
+import { peekFiscal, signFiscal, validatePlan, verifyFiscal } from "./fiscal-plan.mjs";
+import { createFiscalJournal } from "./fiscal/fiscal-journal.mjs";
+import { createFiscalHost, parseFiscalMachines } from "./fiscal/fiscal-host.mjs";
+import { listSerialPorts, openSerialLink } from "./fiscal/serial-link.mjs";
+import { runFiscalProbe } from "./fiscal/probe-cli.mjs";
 import crypto from "node:crypto";
 import path from "node:path";
 
@@ -60,6 +71,10 @@ const argv = process.argv.slice(2);
 if (argv[0] === "pair") {
   await runPair(argv.slice(1));
   process.exit(0);
+}
+// Hardware checklist for a máquina fiscal: reads only (ENQ, SV, S1, S3).
+if (argv[0] === "fiscal-probe") {
+  process.exit(await runFiscalProbe(argv.slice(1)));
 }
 
 // Windows: a stray click inside the console window puts conhost into
@@ -158,6 +173,36 @@ if (lanStore) {
     archive = createTicketArchive({ dir: path.join(STATE_DIR, "lan", "archive"), log });
   } catch (e) {
     console.error(`LAN: archivo de tickets desactivado (${e.message})`);
+  }
+}
+// 0.9.0 máquina fiscal host. Independent too: a broken journal switches off
+// only the fiscal routes (hello stops listing "fiscal").
+let fiscalJournal = null;
+let fiscalHost = null;
+if (lanStore) {
+  try {
+    fiscalJournal = createFiscalJournal({ dir: path.join(STATE_DIR, "fiscal"), log });
+    fiscalHost = createFiscalHost({
+      machines: parseFiscalMachines(cfg.fiscalMachines),
+      saveMachines: (list) => {
+        updateConfigRaw((raw) => {
+          raw.fiscal_machines = list;
+          return true;
+        });
+      },
+      openLink: (port) => openSerialLink(port, { log }),
+      listPorts: listSerialPorts,
+      journal: fiscalJournal,
+      // Results are signed with the pairing the plan came through, so the
+      // app knows the number came from the machine (not typed).
+      signResult: (bridgeTokenId, payload) => {
+        const sec = lanSecrets.get(bridgeTokenId);
+        return sec ? signFiscal(sec.secret, "result", payload) : null;
+      },
+      log,
+    });
+  } catch (e) {
+    console.error(`LAN: máquina fiscal desactivada (${e.message})`);
   }
 }
 // Where the store-and-forward uploader posts (configs paired before 0.7.0
@@ -677,6 +722,7 @@ function lanHello(claims) {
   if (relayBoard) features.push("relay", "seq");
   if (relayBoard && opsStore) features.push("ops");
   if (archive) features.push("archive");
+  if (fiscalHost) features.push("fiscal");
   return {
     device_id: DEVICE_ID,
     now: new Date().toISOString(),
@@ -690,6 +736,7 @@ function lanHello(claims) {
     ...(relayBoard ? { relay: relayBoard.stats(claims.r) } : {}),
     ...(opsStore ? { ops: opsStore.stats(claims.r) } : {}),
     ...(archive ? { archive: { today: archive.countToday(claims.r) } } : {}),
+    ...(fiscalHost ? { fiscal: fiscalHost.summary(claims.r) } : {}),
   };
 }
 
@@ -839,7 +886,10 @@ async function ticketReprint(claims, req) {
     printer_id: printerId,
     order_id: rec.order_id ?? null,
     kind: rec.kind,
-    payload: { ...payload, meta: { ...(payload.meta ?? {}), reprint: true } },
+    payload: {
+      ...payload,
+      meta: { ...(payload.meta ?? {}), reprint: true, reprinted_at: new Date().toISOString() },
+    },
   };
   inFlight.add(job.id);
   const run = serialized(printerId, async () => {
@@ -865,6 +915,91 @@ async function ticketReprint(claims, req) {
   return { status: 200, body: { ok: false, status: "failed", error: outcome.error } };
 }
 
+// ── 0.9.0: máquina fiscal ────────────────────────────────────────────────
+
+const SCOPE_REFUSED = { status: 403, body: { ok: false, error: "scope" } };
+
+function hasFiscalScope(claims, scope) {
+  return lanTokenHasScope(claims, scope) || (scope === "fiscal_report" && lanTokenHasScope(claims, "fiscal_admin"));
+}
+
+/** A signed payload of `kind` for THIS pairing and the token's restaurant. */
+function verifyFiscalToken(claims, kind, token) {
+  const peek = peekFiscal(token);
+  if (!peek || peek.kind !== kind) return { ok: false, error: kind };
+  if (peek.payload.t !== claims.t) return { ok: false, error: `${kind}_bridge` };
+  const sec = lanSecrets.get(claims.t);
+  if (!sec) return { ok: false, error: "unknown_pairing" };
+  const v = verifyFiscal(sec.secret, kind, token);
+  if (!v.ok) return { ok: false, error: `${kind}_${v.reason}` };
+  if (v.payload.r !== claims.r || sec.restaurantId !== claims.r || !cfg.restaurantIds.includes(claims.r)) {
+    return { ok: false, error: `${kind}_restaurant` };
+  }
+  return { ok: true, payload: v.payload };
+}
+
+async function fiscalStatus(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  return { status: 200, body: { ok: true, ...(await fiscalHost.status(claims.r, { live: req.live })) } };
+}
+
+async function fiscalInvoice(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  const v = verifyFiscalToken(claims, "plan", req.plan);
+  if (!v.ok) return { status: 400, body: { ok: false, error: v.error } };
+  const p = validatePlan(v.payload);
+  if (!p.ok) return { status: 400, body: { ok: false, error: `plan_${p.error}` } };
+  return fiscalHost.invoice(claims, p.plan);
+}
+
+function fiscalJob(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  const body = fiscalHost.job(claims.r, req.job);
+  return { status: body.ok ? 200 : 404, body };
+}
+
+function fiscalAck(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  const v = verifyFiscalToken(claims, "receipt", req.receipt);
+  if (!v.ok || !Array.isArray(v.payload.jobs)) return { status: 400, body: { ok: false, error: v.ok ? "receipt" : v.error } };
+  const jobs = v.payload.jobs.filter((j) => typeof j === "string").slice(0, 200);
+  return { status: 200, body: { ok: true, recorded: fiscalHost.ack(claims.r, jobs) } };
+}
+
+async function fiscalPorts(claims) {
+  if (!fiscalHost) return NOT_FOUND;
+  if (!hasFiscalScope(claims, "fiscal_admin")) return SCOPE_REFUSED;
+  return { status: 200, body: { ok: true, ports: await fiscalHost.ports() } };
+}
+
+async function fiscalConnect(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  if (!hasFiscalScope(claims, "fiscal_admin")) return SCOPE_REFUSED;
+  return { status: 200, body: await fiscalHost.connect(claims.r, req) };
+}
+
+async function fiscalDisconnect(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  if (!hasFiscalScope(claims, "fiscal_admin")) return SCOPE_REFUSED;
+  const body = await fiscalHost.disconnect(claims.r, req.registro);
+  return { status: body.ok ? 200 : 404, body };
+}
+
+async function fiscalTest(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  if (!hasFiscalScope(claims, "fiscal_admin")) return SCOPE_REFUSED;
+  const lines = req.lines.length ? req.lines : ["Prueba de conexion", `Bridge ${VERSION}`];
+  log(`fiscal: documento de prueba en ${req.registro} (pedido por ${claims.u})`);
+  return { status: 200, body: await fiscalHost.test(claims.r, req.registro, lines) };
+}
+
+async function fiscalReportX(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  if (!hasFiscalScope(claims, "fiscal_report")) return SCOPE_REFUSED;
+  log(`fiscal: Reporte X en ${req.registro} (pedido por ${claims.u})`);
+  return { status: 200, body: await fiscalHost.reportX(claims.r, req.registro) };
+}
+
 async function startLanServer() {
   if (!lanEnabled) {
     log(cfg.mode === "device"
@@ -887,6 +1022,9 @@ async function startLanServer() {
     retry: lanRetry,
     ...(relayBoard ? { relayPush, relayPull, relayAck, relaySeq } : {}),
     ...(archive ? { ticketsList, ticketReprint } : {}),
+    ...(fiscalHost
+      ? { fiscalStatus, fiscalInvoice, fiscalJob, fiscalAck, fiscalPorts, fiscalConnect, fiscalDisconnect, fiscalTest, fiscalReportX }
+      : {}),
     log,
   });
   try {
@@ -909,9 +1047,17 @@ async function startLanServer() {
     relayBoard?.compact();
     opsStore?.compact();
     archive?.compact();
+    fiscalJournal?.compact();
   }, 60 * 60_000);
   process.on("SIGINT", () => { void server.close(); });
   resumeLanQueue();
+  // Facturas cut short by the last shutdown are resolved against the
+  // machine first (it needs no internet).
+  if (fiscalHost) {
+    fiscalJournal.compact();
+    if (fiscalHost.machines.length) log(`fiscal: ${fiscalHost.machines.map((m) => `${m.registro} en ${m.port}`).join(", ")}`);
+    void fiscalHost.recover();
+  }
 }
 
 /** Fetch this device's LAN token keys (one per pairing row) and persist them,
@@ -1099,7 +1245,8 @@ async function main() {
   // Started before sign-in so a bridge stuck signing in can still update.
   const selfUpdate = startSelfUpdate({
     log,
-    isBusy: () => inFlight.size > 0,
+    // A factura mid-print must never be cut by a restart either.
+    isBusy: () => inFlight.size > 0 || !!fiscalHost?.busy(),
     repo: cfg.updateRepo,
     disabled: cfg.disableAutoUpdate,
   });

@@ -341,6 +341,28 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
     esc.feed(1);
   }
 
+  // ----- Nota de entrega (284, mirror of kitchen-ticket.ts) -----
+  if (p.kind === "customer_ticket" && L.factura !== false && !p.fiscal && p.delivery_note) {
+    const n = p.delivery_note;
+    esc.align("center");
+    med({ bold: true });
+    esc.line(`NOTA DE ENTREGA N° ${n.number}`);
+    plain();
+    med();
+    esc.line("No sustituye la factura");
+    esc.align("left");
+    const issuer = [n.issuer_tax_id ? `RIF ${n.issuer_tax_id}` : null, n.issuer_legal_name]
+      .filter(Boolean)
+      .join(" · ");
+    if (issuer) for (const ln of wrap(issuer, COLS)) esc.line(ln);
+    const customer = [n.customer_name, n.customer_tax_id ? `RIF/CI ${n.customer_tax_id}` : null]
+      .filter(Boolean)
+      .join(" · ");
+    if (customer) for (const ln of wrap(`Cliente: ${customer}`, COLS)) esc.line(ln);
+    plain();
+    esc.feed(1);
+  }
+
   // ----- Station header (158, mirror of kitchen-ticket.ts) -----
   if (L.estacion !== false && p.station_label) {
     esc.align("center");
@@ -375,6 +397,10 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   }
   if (L.hora !== false) {
     esc.line(`Hora: ${formatTime(p.created_at)}`);
+  }
+  // Reprint time (0.9.0) — mirror of kitchen-ticket.ts.
+  if (L.hora_reimpresion === true && p.meta?.reprint && p.meta.reprinted_at) {
+    esc.line(`Reimpresión: ${formatTime(p.meta.reprinted_at)}`);
   }
   plain();
 
@@ -655,21 +681,35 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
         esc.line("TOTAL EN MONEDAS");
         plain();
 
-        const colWidth = Math.floor(COLS / cells.length);
-        // Dotted only when every figure leaves a gap in its column, all or
+        // Dotted in even columns when every figure leaves a gap; else columns
+        // sized to their widest dotted figure with the rest shared as gaps;
+        // plain in even columns only when even that won't fit. All or
         // nothing (mirror of kitchen-ticket.ts).
-        const group = [...cells, ...withTip].every(
-          (c) => formatMoney(c.amount, c.currency, usdSymbol).length < colWidth,
-        );
+        const rows = withTip.length > 0 ? [cells, withTip] : [cells];
+        const dotted = (c) => formatMoney(c.amount, c.currency, usdSymbol);
+        const colWidth = Math.floor(COLS / cells.length);
+        let widths = cells.map(() => colWidth);
+        let group = rows.every((r) => r.every((c) => dotted(c).length < colWidth));
+        if (!group) {
+          const need = cells.map((c, i) =>
+            Math.max(c.currency.length, ...rows.map((r) => dotted(r[i]).length)),
+          );
+          const spare = COLS - need.reduce((a, b) => a + b, 0);
+          if (spare >= cells.length - 1) {
+            const n = cells.length;
+            widths = need.map((w, i) => w + Math.floor(spare / n) + (i < spare % n ? 1 : 0));
+            group = true;
+          }
+        }
         const valueRow = (row) =>
           row
-            .map((c) =>
-              centerIn(formatMoney(c.amount, c.currency, usdSymbol, group), colWidth),
+            .map((c, i) =>
+              centerIn(formatMoney(c.amount, c.currency, usdSymbol, group), widths[i]),
             )
             .join("");
         esc.align("left");
         med({ bold: true });
-        esc.line(cells.map((c) => centerIn(c.currency, colWidth)).join(""));
+        esc.line(cells.map((c, i) => centerIn(c.currency, widths[i])).join(""));
         if (withTip.length > 0) {
           med({ bold: true });
           esc.line(`SIN ${TIP_WORD}`);
