@@ -402,6 +402,10 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   if (L.hora_reimpresion === true && p.meta?.reprint && p.meta.reprinted_at) {
     esc.line(`Reimpresión: ${formatTime(p.meta.reprinted_at)}`);
   }
+  // Reprinted by (0.9.1) — mirror of kitchen-ticket.ts.
+  if (L.usuario_reimpresion === true && p.meta?.reprint && p.meta.reprinted_by) {
+    for (const ln of wrap(`Reimpreso por: ${p.meta.reprinted_by}`, COLS)) esc.line(ln);
+  }
   plain();
 
   med();

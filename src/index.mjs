@@ -888,7 +888,13 @@ async function ticketReprint(claims, req) {
     kind: rec.kind,
     payload: {
       ...payload,
-      meta: { ...(payload.meta ?? {}), reprint: true, reprinted_at: new Date().toISOString() },
+      meta: {
+        ...(payload.meta ?? {}),
+        reprint: true,
+        reprinted_at: new Date().toISOString(),
+        // 0.9.1: who asked for it now — never the archived copy's reprinter.
+        reprinted_by: req.reprinted_by ?? undefined,
+      },
     },
   };
   inFlight.add(job.id);

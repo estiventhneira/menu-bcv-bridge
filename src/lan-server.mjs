@@ -134,6 +134,8 @@ const ORIGIN_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const OP_TYPE_RE = /^[a-z_]{3,64}$/;
 const TICKET_ID_RE = /^[A-Za-z0-9_-]{8,200}$/;
+/** «Reimpreso por» cap — mirror of REPRINTED_BY_MAX in src/lib/printing/lan-print.client.ts. */
+const REPRINTED_BY_MAX = 60;
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 function isPlainObject(x) {
@@ -277,12 +279,16 @@ export function validateTicketsList(body) {
   return { ok: true, query: { order_id: orderId, since_ms: since, limit, kinds } };
 }
 
-/** @returns {{ ok: true, reprint: { id: string, printer_id: string | null } } | { ok: false, error: string }} */
+/** @returns {{ ok: true, reprint: { id: string, printer_id: string | null, reprinted_by: string | null } } | { ok: false, error: string }} */
 export function validateTicketReprint(body) {
   if (!isPlainObject(body) || typeof body.id !== "string" || !TICKET_ID_RE.test(body.id)) return { ok: false, error: "id" };
   const printerId = body.printer_id ?? null;
   if (printerId !== null && (typeof printerId !== "string" || !UUID_RE.test(printerId))) return { ok: false, error: "printer_id" };
-  return { ok: true, reprint: { id: body.id, printer_id: printerId } };
+  // 0.9.1: who asked for it («Reimpreso por»), printed only when the printer
+  // turns on usuario_reimpresion. Decorative, so a bad value is dropped
+  // rather than refusing the reprint.
+  const by = typeof body.reprinted_by === "string" ? body.reprinted_by.trim().slice(0, REPRINTED_BY_MAX) : "";
+  return { ok: true, reprint: { id: body.id, printer_id: printerId, reprinted_by: by || null } };
 }
 
 // ── 0.9.0 validators (máquina fiscal) ───────────────────────────────────
