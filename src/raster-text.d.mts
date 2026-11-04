@@ -19,6 +19,8 @@ export interface RasterSegment {
   bold: boolean;
   wMul: number;
   hMul: number;
+  /** Tachado: a bar through the segment's inked span. */
+  strike?: boolean;
 }
 
 export interface ComposedLine {
@@ -55,6 +57,7 @@ export class RasterTextEngine {
   magnify(w: number, h: number): void;
   lineSpacing(dots: number): void;
   charSpacing(dots: number): void;
+  strike(on: boolean): void;
   text(s: string): number[];
   line(s?: string): number[];
   feed(n?: number): number[];

@@ -38,10 +38,17 @@ export function writeTimeoutMsFor(byteLength) {
   return Math.max(30_000, 2 * graceMsFor(byteLength));
 }
 
+/**
+ * Errors raised before the connection opened carry `notConnected: true`: not
+ * one byte reached the printer, so retrying can't duplicate a ticket. After
+ * connect, an error (EPIPE, ECONNRESET, the write timeout) may follow a
+ * partial ticket and stays unmarked.
+ */
 export function sendOverTcp(host, port, bytes, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     const sock = new net.Socket();
     let done = false;
+    let connected = false;
     let timer = null;
     const settle = (fn, value) => {
       if (done) return;
@@ -53,14 +60,22 @@ export function sendOverTcp(host, port, bytes, timeoutMs = 10_000) {
     // A module that talks back (status bytes, echoes) must not stall the
     // stream; nothing here reads it.
     sock.on("data", () => {});
-    sock.once("error", (err) => settle(reject, err));
+    sock.once("error", (err) => {
+      if (!connected) err.notConnected = true;
+      settle(reject, err);
+    });
 
     timer = setTimeout(
-      () => settle(reject, new Error(`Timeout connecting to ${host}:${port}`)),
+      () =>
+        settle(
+          reject,
+          Object.assign(new Error(`Timeout connecting to ${host}:${port}`), { notConnected: true }),
+        ),
       timeoutMs,
     );
 
     sock.connect(port, host, () => {
+      connected = true;
       // Connected: from here on the budget is the write's, not the connect's.
       clearTimeout(timer);
       timer = setTimeout(

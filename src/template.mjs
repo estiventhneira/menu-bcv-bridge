@@ -39,6 +39,16 @@ function isTypeChangeNotice(p) {
   );
 }
 
+// A dish-swap notice (0.9.2): one SUSTITUIDO ticket for the old and new
+// line — mirror of isSwapNotice in kitchen-ticket.ts.
+function isSwapNotice(p) {
+  return (
+    p.kind === "kitchen_modification" &&
+    p.modification_type === "added" &&
+    (p.replaced_items?.length ?? 0) > 0
+  );
+}
+
 function formatTime(iso) {
   try {
     const d = new Date(iso);
@@ -250,6 +260,7 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   }
 
   const typeChange = isTypeChangeNotice(p);
+  const swap = isSwapNotice(p);
   if (p.kind === "kitchen_modification") {
     esc.align("center");
     big({ bold: true });
@@ -260,7 +271,9 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
           ? "CAMBIO DE TIPO"
           : p.modification_type === "table_changed"
             ? "CAMBIO DE MESA"
-            : "AGREGADO",
+            : swap
+              ? "SUSTITUIDO"
+              : "AGREGADO",
     );
     plain();
     esc.feed(1);
@@ -417,18 +430,10 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   const sectionAt = new Map();
   for (const s of p.sections ?? []) sectionAt.set(s.index, s.label);
   const allItems = p.items ?? [];
-  for (let itemIdx = 0; itemIdx < allItems.length; itemIdx++) {
-    const item = allItems[itemIdx];
-    if (sectionAt.has(itemIdx)) {
-      const label = sectionAt.get(itemIdx) ?? null;
-      med();
-      esc.rule(COLS);
-      plain();
-      med({ bold: true });
-      esc.line(label ? `ESTACIÓN: ${label.toUpperCase()}` : "SIN ESTACIÓN");
-      plain();
-    }
-    const qty = `${item.quantity}x `;
+  // Swap lines are signed: old "-" (tachadas in raster mode), new "+" —
+  // mirror of kitchen-ticket.ts. Unsigned elsewhere → legacy bytes.
+  const printItem = (item, sign, struck) => {
+    const qty = `${sign}${item.quantity}x `;
     const wrapped = wrap(item.name, COLS - qty.length);
     const money =
       L.item_prices !== false && p.kind === "customer_ticket" && p.financials && item.line_total != null
@@ -444,10 +449,15 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       items();
       esc.line(" ".repeat(COLS - first.length - money.length) + money);
       if (wrapped.length > 1) items({ bold: true });
+    } else if (struck) {
+      esc.text(sign).strike(true).line(first.slice(sign.length)).strike(false);
     } else {
       esc.line(first);
     }
-    for (let i = 1; i < wrapped.length; i++) esc.line(" ".repeat(qty.length) + wrapped[i]);
+    for (let i = 1; i < wrapped.length; i++) {
+      if (struck) esc.text(" ".repeat(qty.length)).strike(true).line(wrapped[i]).strike(false);
+      else esc.line(" ".repeat(qty.length) + wrapped[i]);
+    }
     if (money !== null && !inline) {
       items();
       const pad = Math.max(1, COLS - money.length);
@@ -467,6 +477,21 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
       for (const ln of wrap(`Nota: ${item.notes.trim()}`, COLS - 2)) esc.line("  " + ln);
     }
     plain();
+  };
+  for (let itemIdx = 0; itemIdx < allItems.length; itemIdx++) {
+    if (sectionAt.has(itemIdx)) {
+      const label = sectionAt.get(itemIdx) ?? null;
+      med();
+      esc.rule(COLS);
+      plain();
+      med({ bold: true });
+      esc.line(label ? `ESTACIÓN: ${label.toUpperCase()}` : "SIN ESTACIÓN");
+      plain();
+    }
+    if (swap && itemIdx === 0) {
+      for (const old of p.replaced_items ?? []) printItem(old, "- ", true);
+    }
+    printItem(allItems[itemIdx], swap ? "+ " : "", false);
   }
 
   // ----- Other-stations hint (158, mirror of kitchen-ticket.ts) -----

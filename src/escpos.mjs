@@ -117,6 +117,12 @@ export class EscPos {
     if (this.rt) return this;
     return this.push(ESC, 0x47, on ? 1 : 0);
   }
+  // Tachado — raster mode only (text mode has no strike-through): the ROM
+  // path emits nothing. Unaffected by ESC ! n.
+  strike(on) {
+    if (this.rt) this.rt.strike(on);
+    return this;
+  }
   // ESC SP n — right-side character spacing in dots (0..255).
   charSpacing(dots) {
     if (this.rt) { this.rt.charSpacing(dots); return this; }

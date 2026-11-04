@@ -23,6 +23,10 @@
  * with a plan the app server signed (fiscal/fiscal-host.mjs, design
  * docs/plans/2026-10-07-fiscal-bridge-host-design.md).
  *
+ * 0.9.2 follows a wifi printer by its MAC when the router gives it another IP
+ * (printer-follow.mjs) and reports why a printer isn't answering
+ * (bridge_tokens.printer_status, migration 366).
+ *
  * One process can drive many printers across one or more restaurants on the
  * same PC (e.g. a restaurant and its sucursal): run `pair` once per
  * restaurant — the same device account accumulates them.
@@ -37,7 +41,9 @@
 import { createClient } from "@supabase/supabase-js";
 import { loadConfig, parseLanSecrets, stateDir, updateConfigRaw } from "./config.mjs";
 import { runPair } from "./pair.mjs";
-import { startDiscovery, isConnectionError } from "./discover.mjs";
+import { startDiscovery, isConnectionError, probe } from "./discover.mjs";
+import { readArpTable } from "./arp.mjs";
+import { createPrinterFollow } from "./printer-follow.mjs";
 import { startSelfUpdate } from "./self-update.mjs";
 import { disableQuickEdit } from "./console-mode.mjs";
 import { VERSION } from "./version.mjs";
@@ -49,11 +55,12 @@ import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import { DRAIN_SLOW_MS, DRAIN_TICK_MS, drainDue, drainIntervalMs } from "./drain-poll.mjs";
 import { createPrinterChains, startJobs } from "./job-queue.mjs";
+import { createPrinterRests, failedJobUpdate } from "./printer-cooldown.mjs";
 import { buildAllowedOrigins, createLanServer } from "./lan-server.mjs";
 import { createLanStore, LAN_MAX_ATTEMPTS, lanRetryDelayMs } from "./lan-journal.mjs";
 import { peekLanTokenClaims, verifyLanToken } from "./lan-token.mjs";
 import { lanAddresses, startLanEndpointsReporter } from "./lan-endpoints.mjs";
-import { loadPrinterCache, savePrinterCache } from "./printer-cache.mjs";
+import { loadFollowCache, loadPrinterCache, saveFollowCache, savePrinterCache } from "./printer-cache.mjs";
 import { createRelayBoard } from "./lan-relay.mjs";
 import { createOpsStore } from "./lan-ops.mjs";
 import { createOpsUploader } from "./lan-upload.mjs";
@@ -137,12 +144,35 @@ const printers = new Map();
 const inFlight = new Set();
 // One job at a time per printer, printers in parallel — see job-queue.mjs.
 const serialized = createPrinterChains();
+// Wifi printers whose last connection never opened rest a while: their jobs
+// stay pending instead of burning attempts — see printer-cooldown.mjs.
+const rests = createPrinterRests();
+// printer id -> the drain that ends its rest.
+const restDrainTimers = new Map();
 // Discovery reporter (device mode only) — see discover.mjs.
 let discovery = null;
 
 // ── LAN print server state (0.7.0, device mode only) ─────────────────────
 const STATE_DIR = stateDir();
 const PRINTER_CACHE_FILE = path.join(STATE_DIR, "cache", "printers.json");
+
+// Wifi printers followed by their MAC when the router gives them another IP
+// (0.9.2) — see printer-follow.mjs. Both auth modes: the follow is local;
+// only its report to the app needs a device account.
+const FOLLOW_FILE = path.join(STATE_DIR, "cache", "printer-follow.json");
+const follow = createPrinterFollow({
+  readArp: () => readArpTable(),
+  probe,
+  requestScan: (opts) => discovery?.triggerFailureRescan(opts) ?? false,
+  onFollow: applyFollow,
+  onChange: () => {
+    saveFollowState();
+    scheduleStatusReport();
+  },
+  nameOf: (id) => printers.get(id)?.name ?? id.slice(0, 8),
+  saved: loadFollowCache(FOLLOW_FILE),
+  log,
+});
 const lanEnabled = cfg.mode === "device" && !cfg.disableLanServer;
 let lanStore = null;
 if (lanEnabled) {
@@ -245,12 +275,18 @@ async function reloadPrinters() {
     const paperDots = paperDotsForWidth(p.paper_width_mm);
     if (p.transport === "wifi") {
       if (!c.host) continue;
+      const port = Number(c.port) || 9100;
       printers.set(p.id, {
+        // The rests (printer-cooldown.mjs) and the follow are keyed by it.
+        id: p.id,
         restaurant_id: p.restaurant_id,
         transport: "wifi",
         name: p.name,
-        host: c.host,
-        port: Number(c.port) || 9100,
+        // Where it answers now: its saved IP, or the one the bridge followed
+        // it to by MAC (printer-follow.mjs) until someone saves that one.
+        host: follow.resolveHost(p.id, c.host, port),
+        configured_host: c.host,
+        port,
         chars_per_line: charsPerLine,
         paper_dots: paperDots,
         print_settings: printSettings,
@@ -259,6 +295,7 @@ async function reloadPrinters() {
     } else if (p.transport === "usb_bridge") {
       if (!c.os_printer_name) continue;
       printers.set(p.id, {
+        id: p.id,
         restaurant_id: p.restaurant_id,
         transport: "usb_bridge",
         name: p.name,
@@ -270,8 +307,9 @@ async function reloadPrinters() {
       });
     }
   }
+  follow.retain(new Set([...printers].filter(([, p]) => p.transport === "wifi").map(([id]) => id)));
   const describe = (p) => p.transport === "wifi"
-    ? `${p.name}@${p.host}:${p.port}`
+    ? `${p.name}@${p.host}:${p.port}${p.host !== p.configured_host ? ` (guardada ${p.configured_host})` : ""}`
     : `${p.name}@spooler:${p.os_printer_name}`;
   // Only announce when the tracked set actually changed — this runs on every
   // printers event and used to flood the console during setup.
@@ -307,7 +345,7 @@ function restorePrintersFromCache() {
   const cached = loadPrinterCache(PRINTER_CACHE_FILE);
   if (!cached) return;
   for (const { id, ...p } of cached.printers) {
-    if (cfg.restaurantIds.includes(p.restaurant_id)) printers.set(id, p);
+    if (cfg.restaurantIds.includes(p.restaurant_id)) printers.set(id, { ...p, id });
   }
   lastCachedJson = JSON.stringify([...printers.entries()]);
   log(`printers: ${printers.size} desde la caché local (guardada ${cached.savedAt ?? "?"})`);
@@ -394,6 +432,9 @@ async function processJob(job) {
   }
   const printer = printers.get(job.printer_id);
   if (!printer) return; // not our printer
+  // Left pending: the drain after the rest picks it up. Offline LAN tickets
+  // exist only in the journal, so they keep their own retry timer instead.
+  if (job.lan?.source !== "offline" && rests.isResting(printer.id, performance.now())) return;
   inFlight.add(job.id);
   try {
     // The claim waits inside the chain, so a queued job stays 'pending'
@@ -428,11 +469,90 @@ async function sendToPrinter(printer, bytes) {
 }
 
 function noteSendFailure(printer, e) {
-  // A wifi printer that stopped answering may have moved to a new DHCP
-  // address — rescan (debounced) so the app can suggest the fix.
-  if (printer.transport === "wifi" && isConnectionError(e)) {
+  if (printer.transport !== "wifi" || !isConnectionError(e)) return;
+  if (e?.notConnected === true) {
+    // 0.9.2: say why, and look for the printer by its MAC in case the router
+    // moved it — printer-follow.mjs books the rescan, sooner when it knows
+    // which card to look for.
+    follow.noteUnreachable(printer.id, printer.host, e);
+  } else {
+    // A wifi printer that stopped answering may have moved to a new DHCP
+    // address — rescan (debounced) so the app can suggest the fix.
     discovery?.triggerFailureRescan();
   }
+}
+
+/** A ticket reached the printer: it's out of any rest, and a wifi printer's
+ *  MAC gets (re)learned for printer-follow.mjs. */
+function noteSendSuccess(printer) {
+  rests.noteReachable(printer.id);
+  if (printer.transport === "wifi") follow.noteReachable(printer.id, printer.host);
+}
+
+/** printer-follow.mjs found the printer's card at another IP: print there,
+ *  starting with the jobs left pending while it rested. */
+function applyFollow(printerId, host) {
+  const p = printers.get(printerId);
+  if (!p || p.transport !== "wifi" || p.host === host) return;
+  p.host = host;
+  savePrintersForOfflineBoot();
+  rests.noteReachable(printerId);
+  clearTimeout(restDrainTimers.get(printerId));
+  restDrainTimers.delete(printerId);
+  void drainPending();
+}
+
+function saveFollowState() {
+  try {
+    saveFollowCache(FOLLOW_FILE, follow.serialize());
+  } catch (e) {
+    log(`ERROR guardando el seguimiento de impresoras: ${e.message}`);
+  }
+}
+
+// Printer status for the app (0.9.2, migration 366): the printer's MAC, the
+// IP the bridge followed it to, why it isn't answering. Observations only,
+// like discoveries; sent when something changes and every 30 min.
+let statusTimer = null;
+let statusError = null;
+function scheduleStatusReport() {
+  if (cfg.mode !== "device" || statusTimer) return;
+  statusTimer = setTimeout(() => {
+    statusTimer = null;
+    void reportPrinterStatus();
+  }, 3_000);
+}
+
+async function reportPrinterStatus() {
+  try {
+    if (cfg.mode !== "device" || !(await hasCloudSession())) return;
+    const { error } = await supabase.rpc("bridge_report_printer_status", { p_status: follow.report() });
+    // Before migration 366 every call fails the same way: say it once.
+    if (error && error.message !== statusError) log(`printer status: ${error.message}`);
+    statusError = error?.message ?? null;
+  } catch (e) {
+    log(`printer status: ${e.message}`);
+  }
+}
+
+/**
+ * A wifi printer whose connection never opened rests (printer-cooldown.mjs),
+ * and a drain is booked for when the rest ends so its jobs don't wait for
+ * the next slow poll. Returns whether the connection never opened.
+ */
+function restIfUnreachable(printer, e) {
+  if (printer.transport !== "wifi" || e?.notConnected !== true) return false;
+  const ms = rests.noteUnreachable(printer.id, performance.now());
+  log(`${printer.name} no responde: sus trabajos esperan ${ms / 1000}s`);
+  clearTimeout(restDrainTimers.get(printer.id));
+  restDrainTimers.set(
+    printer.id,
+    setTimeout(() => {
+      restDrainTimers.delete(printer.id);
+      void drainPending();
+    }, ms + 250),
+  );
+  return true;
 }
 
 /** Resolves `fallback` if `p` hasn't settled within `ms`. */
@@ -468,6 +588,8 @@ async function runJob(job, printer) {
   let claimed = false;
   let blind = false;
   let claimedOrderId = null;
+  // Queued behind the job whose connection just failed: leave it pending.
+  if (rests.isResting(printer.id, performance.now())) return "skipped";
   try {
     if (lan && !(await hasCloudSession())) {
       blind = true;
@@ -506,6 +628,7 @@ async function runJob(job, printer) {
     log(`printing job ${job.id} → ${printer.name} (${printer.transport})${lan ? " [red local]" : ""}${blind ? " [sin nube]" : ""}`);
     const bytes = renderJob(job, printer);
     await sendToPrinter(printer, bytes);
+    noteSendSuccess(printer);
     archiveTicket({ ...job, order_id: job.order_id ?? claimedOrderId }, printer, lan ? "lan" : "cloud");
     if (blind) {
       lanStore?.markPrinted(job.id, { src: "cloud", pid: job.printer_id, kind: job.kind, acked: false });
@@ -523,21 +646,29 @@ async function runJob(job, printer) {
   } catch (e) {
     log(`FAIL job ${job.id}: ${e.message}`);
     noteSendFailure(printer, e);
+    const notConnected = restIfUnreachable(printer, e);
     // Never claimed (printed blind over the LAN): the row is still pending in
     // the cloud and this bridge picks it up from there when it reconnects.
     if (lan && !claimed) return "failed";
-    // Bump attempts; mark failed when too many.
+    // Bump attempts and mark failed when too many — except a comanda whose
+    // printer never answered, or any job of a printer the bridge is looking
+    // for by its MAC: those wait pending (printer-cooldown.mjs).
     const { data: cur } = await supabase
       .from("print_jobs")
       .select("attempts")
       .eq("id", job.id)
       .single();
-    const attempts = (cur?.attempts ?? 0) + 1;
-    const giveUp = attempts >= cfg.maxAttempts;
+    const { status, attempts } = failedJobUpdate({
+      kind: job.kind,
+      notConnected,
+      locating: notConnected && follow.isLocating(printer.id),
+      attempts: cur?.attempts ?? 0,
+      maxAttempts: cfg.maxAttempts,
+    });
     const { error: requeueErr } = await supabase
       .from("print_jobs")
       .update({
-        status: giveUp ? "failed" : "pending",
+        status,
         attempts,
         error: e.message,
         claimed_at: null,
@@ -582,6 +713,7 @@ async function runOfflineLanJob(job, printer) {
     log(`printing LAN job ${job.id} → ${printer.name} (${printer.transport}, pedido sin conexión)`);
     const bytes = renderJob(job, printer);
     await sendToPrinter(printer, bytes);
+    noteSendSuccess(printer);
     archiveTicket(job, printer, "offline");
     lanStore.markPrinted(job.id, { src: "offline", pid: job.printer_id, kind: job.kind, acked: true });
     log(`ok LAN job ${job.id} (${bytes.length} bytes)`);
@@ -589,6 +721,7 @@ async function runOfflineLanJob(job, printer) {
   } catch (e) {
     log(`FAIL LAN job ${job.id}: ${e.message}`);
     noteSendFailure(printer, e);
+    restIfUnreachable(printer, e);
     const rec = lanStore.getJob(job.id);
     if (!rec) return "failed";
     const attempts = (rec.attempts ?? 0) + 1;
@@ -901,6 +1034,7 @@ async function ticketReprint(claims, req) {
   const run = serialized(printerId, async () => {
     const bytes = renderJob(job, printer);
     await sendToPrinter(printer, bytes);
+    noteSendSuccess(printer);
     archiveTicket(job, printer, "reprint", { reprintOf: rec.id, userId: claims.u });
     log(`lan: reimpresión de ${rec.kind} → ${printer.name} (${rec.order_number ?? rec.label ?? rec.id.slice(0, 8)})`);
   }).finally(() => inFlight.delete(job.id));
@@ -1149,7 +1283,7 @@ async function reapStuckJobs() {
     if (error) {
       log("ERROR reaper:", error.message);
     } else if (data > 0) {
-      log(`reaper: re-queued ${data} stuck job(s)`);
+      log(`reaper: ${data} trabajo(s) re-encolado(s) o vencido(s)`);
       scheduleSiblingDrain();
     }
   }
@@ -1175,7 +1309,10 @@ function noteRealtimeJob(job) {
 }
 
 async function drainPending() {
-  const ids = Array.from(printers.keys());
+  // Resting printers stay out: a dead printer's pending comandas would
+  // otherwise fill the 20-row page and starve the other printers.
+  const now = performance.now();
+  const ids = Array.from(printers.keys()).filter((id) => !rests.isResting(id, now));
   if (ids.length === 0) return;
   const startedAt = performance.now();
   const { data, error } = await supabase
@@ -1286,12 +1423,22 @@ async function main() {
   }
 
   if (cfg.mode === "device" && !cfg.disableDiscovery) {
-    discovery = startDiscovery({ supabase, log, label: cfg.label, version: VERSION });
+    discovery = startDiscovery({
+      supabase,
+      log,
+      label: cfg.label,
+      version: VERSION,
+      readArp: () => readArpTable(),
+      onScan: (responders, info) => follow.onScan(responders, info),
+    });
   } else if (cfg.disableDiscovery) {
     log("discovery: desactivado por config (disable_discovery)");
   } else {
     log("discovery: desactivado en modo legacy (service role) — requiere cuenta de dispositivo; re-pareá con: print-bridge pair <CODIGO>");
   }
+  // Reap first: after a long outage the server fails the comandas that sat
+  // 30+ min (migration 359) instead of this drain printing them in a burst.
+  await reapStuckJobs();
   await drainPending();
 
   // One channel per restaurant: postgres_changes filters only support a
@@ -1378,11 +1525,16 @@ async function main() {
   }
   setInterval(() => { void heartbeat(); }, 30_000);
   setInterval(() => { void reloadPrinters(); }, 5 * 60_000);
+  // Printer status (migration 366): once now that the printers are loaded,
+  // then every 30 min on top of the reports sent when something changes.
+  scheduleStatusReport();
+  setInterval(() => { void reportPrinterStatus(); }, 30 * 60_000);
   setInterval(() => { void reapStuckJobs(); }, REAPER_INTERVAL_MS);
 
   process.on("SIGINT", async () => {
     log("shutting down…");
     discovery?.stop();
+    follow.stop();
     lanEndpoints?.stop();
     uploader?.stop();
     for (const channel of channels) {

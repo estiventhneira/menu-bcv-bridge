@@ -144,7 +144,7 @@ export function composeLine(font, segments, opts) {
     const wMul = Math.max(1, Math.round(seg.wMul) || 1);
     const hMul = Math.max(1, Math.round(seg.hMul) || 1);
     const chars = normalizeRasterText(font, seg.text ?? "");
-    prepared.push({ chars, bold: !!seg.bold, wMul, hMul });
+    prepared.push({ chars, bold: !!seg.bold, strike: !!seg.strike, wMul, hMul });
     const h = cellH * hMul;
     if (h > lineH) lineH = h;
     contentW += chars.length * (cellW * wMul + spacing);
@@ -167,6 +167,26 @@ export function composeLine(font, segments, opts) {
     const gw = cellW * seg.wMul;
     const gh = cellH * seg.hMul;
     const yTop = lineH - gh; // bottom-aligned (baselines meet like on paper)
+    if (seg.strike) {
+      // Tachado: a bar through the segment's inked span (blanks at either
+      // end stay clean), at the middle of the x-height — 7/12 of the cell,
+      // the atlas baseline sitting at 20/24 — and 2 dots thick per ×1.
+      const first = seg.chars.findIndex((c) => c !== " ");
+      if (first >= 0) {
+        let last = seg.chars.length - 1;
+        while (seg.chars[last] === " ") last--;
+        const x0 = x + first * (gw + spacing);
+        const x1 = Math.min(lineDots, x + last * (gw + spacing) + gw);
+        const y0 = yTop + Math.round((cellH * 7) / 12) * seg.hMul - seg.hMul;
+        for (let y = y0; y < y0 + 2 * seg.hMul; y++) {
+          for (let px = x0; px < x1; px++) {
+            const bi = px >> 3;
+            buf[y * rowBytes + bi] |= 0x80 >> (px & 7);
+            if (bi > lastByte) lastByte = bi;
+          }
+        }
+      }
+    }
     for (const ch of seg.chars) {
       if (x >= lineDots) break;
       const rows = glyphRows(face, ch);
@@ -269,6 +289,9 @@ export class RasterTextEngine {
     this.pitch = 0;
     /** `ESC SP n` equivalent, in dots per character. */
     this.spacing = 0;
+    /** Tachado — raster-only (ESC/POS text mode has no strike-through), and
+     *  like `ESC G` it survives `style()`/`magnify()`. */
+    this.strikeOn = false;
     this.segments = [];
   }
 
@@ -298,6 +321,10 @@ export class RasterTextEngine {
     this.spacing = Math.max(0, Math.min(255, Math.round(dots) || 0));
   }
 
+  strike(on) {
+    this.strikeOn = !!on;
+  }
+
   /** Buffer text for the current line. A "\n" inside flushes (it is an LF in
    *  text mode); "\t" and "\r" are dropped — they are bytes the ROM path
    *  would swallow as control codes. */
@@ -307,7 +334,15 @@ export class RasterTextEngine {
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) pushAll(out, this.flush());
       const t = parts[i].replace(/[\t\r]/g, "");
-      if (t) this.segments.push({ text: t, bold: this.bold, wMul: this.wMul, hMul: this.hMul });
+      if (t) {
+        this.segments.push({
+          text: t,
+          bold: this.bold,
+          wMul: this.wMul,
+          hMul: this.hMul,
+          ...(this.strikeOn ? { strike: true } : {}),
+        });
+      }
     }
     return out;
   }

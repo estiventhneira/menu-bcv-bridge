@@ -270,7 +270,7 @@ journalctl -u fujun-bridge -f   # follow logs
 | `spooler 'POS-80': exit 1 — Win32 error 5` | "Access denied." The bridge process can't see the printer because it's installed for a different Windows user. Either reinstall the printer as "Share this printer" → "Render print jobs on client computers", or run the bridge as the same user who installed the printer. |
 | Garbled text prints | The OS printer is configured with a vendor driver that intercepts the bytes. Reinstall it with the **Generic / Text Only** driver. |
 | `realtime: CONNECTING` (never SUBSCRIBED) | No internet, wrong `supabase_url`, or wrong key. |
-| `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. |
+| `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. 0.9.2+: the printers page says what answered at that IP — another device's MAC there means an IP conflict (set the printer to DHCP, or reserve its IP on the router with the MAC shown). |
 | Jobs queue but never print | Bridge isn't running, or printer is `is_active=false` in the DB. |
 | Windows: jobs queue for hours, then everything prints the moment you press **Enter** in the bridge window (`CHANNEL_ERROR` → `SUBSCRIBED`) | Someone clicked inside the console: QuickEdit "Select" mode blocks every console write, which freezes the whole process. 0.5.3+ turns QuickEdit off on its own console at start. On older builds: right-click the title bar → *Propiedades* → untick *Modo de edición rápida*, or `reg add HKCU\Console /v QuickEdit /t REG_DWORD /d 0 /f`. |
 | App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Builds ≥ 0.5.0 self-update within ~6 h of a release (see Self-update below); older ones don't: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
@@ -535,6 +535,29 @@ since 0.4.1 (a router's port-scan protection throttled a whole LAN at 32
 probes): 4 concurrent probes with 150 ms gaps, port 9100 only, /24 max per
 interface. Legacy service-role configs don't report (no device identity to
 attach it to).
+
+## Following a printer by its MAC (0.9.2)
+
+After a good print the bridge reads the printer's MAC from the PC's ARP
+table (`arp -a`, `arp -an`, `/proc/net/arp`; no extra traffic) and keeps it
+in `cache/printer-follow.json`. When a wifi printer stops answering, it looks
+for that MAC on the LAN: in the ARP table first (confirmed by a probe), then
+in a discovery scan booked 10 s later (at most every 2 min while it searches,
+once per outage). If exactly one host answers TCP:9100 with that MAC, the
+bridge prints there; the jobs waiting for the printer go out, and receipts
+wait for the search too instead of failing first. Several hosts with the same
+MAC (a WiFi repeater that rewrites MACs) follow nothing.
+
+The follow lives on this PC only: the bridge still can't change printer
+config. It reports what it sees to its own pairing rows (RPC
+`bridge_report_printer_status`, migration 366) and the printers page shows
+«La impresora cambió de IP» with a **Guardar la nueva IP** button, or why the
+printer isn't answering: another device's MAC at its IP (an IP conflict), the
+printer itself refusing, or nothing there. An IP typed in the app always wins
+(the bridge forgets the old card and learns whatever answers at the new IP).
+Printers behind a router (another subnet) have no ARP entry, so they're never
+followed. Console lines to look for: `MAC … en …`, `la impresora cambió de IP
+— … → …`.
 
 ## Security note
 

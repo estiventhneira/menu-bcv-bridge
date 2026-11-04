@@ -4,6 +4,11 @@
 // into wifi-form prefill chips, DHCP-drift suggestions, and a spooler-name
 // dropdown — a human always clicks to apply; the bridge only observes.
 //
+// 0.9.2: each responder carries the MAC the ARP table holds for it, and the
+// scan is handed to printer-follow.mjs, which follows a printer whose card
+// now answers at another IP (on this PC only — config still changes by a
+// human click).
+//
 // Device mode only: the RPC writes to bridge_tokens rows keyed off
 // auth.uid(), which legacy service-role bridges don't have.
 //
@@ -34,6 +39,10 @@ const SPOOLER_OUT_CAP = 256 * 1024;
 const PERIODIC_MS = 6 * 60 * 60_000; // startup + failures cover the real use cases
 const FAILURE_DELAY_MS = 10_000; // coalesce a burst of failing jobs
 const FAILURE_COOLDOWN_MS = 15 * 60_000; // dead printer retried every 30s must not scan continuously
+// A printer whose MAC is known gets searched for sooner: once per outage
+// (printer-follow.mjs), so a dead printer still can't scan continuously.
+const LOCATE_COOLDOWN_MS = 2 * 60_000;
+const MAC_RE = /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/;
 
 // ------------------------------------------------------------
 // Connection-error classifier (used by index.mjs to decide when a
@@ -119,7 +128,7 @@ function subnetsToScan() {
 /** TCP-connect probe. Resolves {host, port, rtt_ms} on connect, null
  *  otherwise — a miss is data, not an error. External setTimeout like
  *  printer-tcp.mjs (not socket.setTimeout — less exercised under Bun). */
-function probe(host, port, timeoutMs) {
+export function probe(host, port, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     const sock = new net.Socket();
@@ -300,15 +309,33 @@ function buildPayload(lanResult, ospResult, label, version) {
       host: String(p.host).slice(0, 45),
       port: p.port | 0,
       rtt_ms: Math.max(0, Math.round(p.rtt_ms)),
+      ...(MAC_RE.test(p.mac ?? "") ? { mac: p.mac } : {}),
     })),
     os_printers: osp.slice(0, MAX_OS_PRINTERS),
   };
 }
 
-export function startDiscovery({ supabase, log, label, version }) {
+/** Each responder with the MAC the ARP table holds for it, when it has one
+ *  (a host behind a router has none). */
+export function withMacs(networkPrinters, arp) {
+  return networkPrinters.map((p) => {
+    const mac = arp.get(p.host);
+    return mac ? { ...p, mac } : p;
+  });
+}
+
+/**
+ * @param {{
+ *   supabase: any, log: (...args: unknown[]) => void, label: string, version: string,
+ *   readArp?: () => Promise<Map<string, string>>,
+ *   onScan?: (responders: Array<{ host: string, port: number, mac?: string }>, info: { startedAt: number }) => void,
+ * }} opts
+ */
+export function startDiscovery({ supabase, log, label, version, readArp, onScan }) {
   let scanning = false;
   let lastScanAt = 0;
   let pendingTimer = null;
+  let pendingDueAt = 0;
   let stopped = false;
 
   async function runOnce(reason) {
@@ -316,7 +343,24 @@ export function startDiscovery({ supabase, log, label, version }) {
     scanning = true;
     try {
       log(`discovery: scan (${reason})`);
+      const startedAt = Date.now();
       const [lan, osp] = await Promise.allSettled([scanLan(), listOsPrinters(log)]);
+      // Right after the sweep the table holds a fresh entry for every
+      // responder: the probe itself resolved it.
+      if (lan.status === "fulfilled" && readArp) {
+        try {
+          lan.value.network_printers = withMacs(lan.value.network_printers, await readArp());
+        } catch (e) {
+          log(`discovery: tabla ARP: ${e.message}`);
+        }
+      }
+      if (lan.status === "fulfilled" && onScan) {
+        try {
+          onScan(lan.value.network_printers, { startedAt });
+        } catch (e) {
+          log(`discovery: ${e.message}`);
+        }
+      }
       const payload = buildPayload(lan, osp, label, version);
       const { error } = await supabase.rpc("bridge_report_discoveries", {
         p_discoveries: payload,
@@ -337,17 +381,25 @@ export function startDiscovery({ supabase, log, label, version }) {
   interval.unref?.();
 
   /** First failure scans after 10s (fresh data right when staff opens the
-   *  settings page); later failures are absorbed until 5 min after the last
-   *  scan. One pending rescan max. */
-  function triggerFailureRescan() {
-    if (pendingTimer || stopped) return;
-    const earliest = lastScanAt + FAILURE_COOLDOWN_MS;
-    const delay = Math.max(FAILURE_DELAY_MS, earliest - Date.now());
+   *  settings page); later failures are absorbed until 15 min after the last
+   *  scan — 2 min when `urgent` (printer-follow.mjs is looking for a known
+   *  MAC). One pending rescan max: an urgent request only brings it forward.
+   *  Returns whether a scan is booked. */
+  function triggerFailureRescan({ urgent = false } = {}) {
+    if (stopped) return false;
+    const cooldown = urgent ? LOCATE_COOLDOWN_MS : FAILURE_COOLDOWN_MS;
+    const dueAt = Date.now() + Math.max(FAILURE_DELAY_MS, lastScanAt + cooldown - Date.now());
+    if (pendingTimer) {
+      if (dueAt >= pendingDueAt) return true;
+      clearTimeout(pendingTimer);
+    }
+    pendingDueAt = dueAt;
     pendingTimer = setTimeout(() => {
       pendingTimer = null;
-      void runOnce("failure");
-    }, delay);
+      void runOnce(urgent ? "locate" : "failure");
+    }, dueAt - Date.now());
     pendingTimer.unref?.();
+    return true;
   }
 
   function stop() {

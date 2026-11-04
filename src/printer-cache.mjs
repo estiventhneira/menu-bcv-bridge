@@ -29,6 +29,28 @@ export function savePrinterCache(file, printers) {
 }
 
 /**
+ * Printer-follow state (0.9.2, printer-follow.mjs serialize()): each wifi
+ * printer's MAC and the IP the bridge followed it to. Same atomic write.
+ * @param {string} file
+ * @param {unknown} state
+ */
+export function saveFollowCache(file, state) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+/** The saved follow state, or null (createPrinterFollow validates it). */
+export function loadFollowCache(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * @param {string} file
  * @returns {{ savedAt: string | null, printers: Array<{ id: string } & Record<string, unknown>> } | null}
  */
