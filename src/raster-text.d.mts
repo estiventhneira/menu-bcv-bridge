@@ -41,6 +41,11 @@ export function rasterColsFor(
   paperDots: number,
   charSpacing: number | null | undefined,
 ): number;
+export function romColsFor(
+  paperDots: number,
+  font: string | null | undefined,
+  charSpacing: number | null | undefined,
+): number;
 
 export function normalizeRasterText(font: RasterFont, s: string): string[];
 export function paperDotsForWidth(paperWidthMm: number | null | undefined): number;

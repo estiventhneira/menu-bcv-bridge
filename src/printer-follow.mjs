@@ -24,6 +24,12 @@
 // When the printer isn't found, the report says what answered at its IP:
 // another device's card (conflict), the printer itself refusing (refused),
 // or nothing (unreachable).
+//
+// 0.9.3: a refused or unreachable printer is tried again every minute, and
+// the report clears as soon as it answers. It used to clear only on the
+// printer's next ticket: Pronto Gourmet's Dolce (a few dessert comandas a
+// day) still said «La impresora no responde» hours after it was back
+// (2026-11-11).
 
 /** Re-read a printer's MAC after a good print at most this often — also how
  *  soon a DHCP swap (its IP now reaching another printer) is noticed. */
@@ -35,6 +41,8 @@ export const ARP_FRESH_MS = 3_000;
 /** Jobs of a printer being searched for wait this long at most. */
 export const LOCATE_WINDOW_MS = 4 * 60_000;
 export const PROBE_TIMEOUT_MS = 750;
+/** How often a printer that doesn't answer is tried again. */
+export const RECHECK_MS = 60_000;
 /**
  * Good prints that must see the same new card at the printer's IP — with a
  * scan in between that found the old card nowhere — before it replaces the
@@ -54,6 +62,9 @@ export const MISMATCH_CONFIRM = 3;
 
 export const PROBLEM_STATES = new Set(["conflict", "refused", "unreachable"]);
 const STATES = new Set(["ok", "moved", ...PROBLEM_STATES]);
+/** The problems a connection that opens disproves. Not a conflict: two
+ *  devices sharing an IP take turns answering there. */
+const DOWN_STATES = new Set(["refused", "unreachable"]);
 
 const MAC_RE = /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/;
 const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
@@ -155,6 +166,7 @@ export function createPrinterFollow({
   const printers = loadEntries(saved);
   const learnQueue = new Map(); // printer id -> host it just printed at
   let learnTimer = null;
+  let recheckTimer = null;
   let arpCache = null; // { at, table }
   let arpInflight = null;
   const said = new Set();
@@ -321,6 +333,7 @@ export function createPrinterFollow({
       e.other_printer_id = otherId;
       onChange();
     }
+    armRecheck();
     // Fast path: the card already sits at another IP in the table.
     if (!e.mac) return;
     const elsewhere = [...table].filter(([ip, mac]) => mac === e.mac && ip !== host).map(([ip]) => ip);
@@ -328,6 +341,63 @@ export function createPrinterFollow({
       if (printers.get(id) === e && currentHost(e) === host) follow(id, elsewhere[0]);
     }
   }
+
+  /** The printer answers where its jobs go: whatever was reported is over.
+   *  Returns whether the report changed. */
+  function markAnswering(e) {
+    const state = e.followed_host ? "moved" : "ok";
+    if (e.state === state && !e.host_mac && !e.other_printer_id) return false;
+    e.state = state;
+    e.since = e.followed_host ? e.followed_at : null;
+    e.host_mac = null;
+    e.other_printer_id = null;
+    return true;
+  }
+
+  /** Down, and its IP not in dispute (then the state is the learner's call). */
+  const isDown = (e) => DOWN_STATES.has(e.state) && !e.mismatch_mac;
+
+  /**
+   * Whether the printer itself answers at `host`. One with no card learned
+   * yet (it hasn't printed since 0.9.2, or sits behind a router) is taken at
+   * its word unless another printer's card answers there.
+   */
+  async function answersAt(id, e, host) {
+    if (e.mac) return confirmAt(e, host);
+    if (!(await probe(host, e.port, PROBE_TIMEOUT_MS))) return false;
+    const hostMac = (await readArpFresh().catch(() => null))?.get(host);
+    return !hostMac || !printerWithMac(hostMac, id, host);
+  }
+
+  /** Runs while some printer is down, and stops by itself. */
+  function armRecheck() {
+    if (recheckTimer || ![...printers.values()].some(isDown)) return;
+    recheckTimer = setTimeout(() => {
+      runRecheck().catch((err) => log(`follow: ${err.message}`));
+    }, RECHECK_MS);
+    recheckTimer.unref?.();
+  }
+
+  async function runRecheck() {
+    recheckTimer = null;
+    let changed = false;
+    for (const [id, e] of printers) {
+      if (!isDown(e)) continue;
+      const host = currentHost(e);
+      if (!host || !(await answersAt(id, e, host))) continue;
+      // A print or an edit may have settled it while the probe was out.
+      if (printers.get(id) !== e || currentHost(e) !== host || !isDown(e)) continue;
+      e.checked_at = now();
+      markAnswering(e);
+      log(`${nameOf(id)}: volvió a responder en ${host}`);
+      changed = true;
+    }
+    if (changed) onChange();
+    armRecheck();
+  }
+
+  // A problem saved before a restart may be over by now.
+  armRecheck();
 
   return {
     /**
@@ -383,16 +453,7 @@ export function createPrinterFollow({
       e.checked_at = t;
       e.locate_requested_at = null;
       // While another card answers here, the state is the learner's call.
-      if (!e.mismatch_mac) {
-        const state = e.followed_host ? "moved" : "ok";
-        if (e.state !== state || e.host_mac || e.other_printer_id) {
-          e.state = state;
-          e.since = e.followed_host ? e.followed_at : null;
-          e.host_mac = null;
-          e.other_printer_id = null;
-          onChange();
-        }
-      }
+      if (!e.mismatch_mac && markAnswering(e)) onChange();
       if (!e.mac || e.mismatch_mac || e.mac_host !== host || t - (e.learned_at ?? 0) >= RELEARN_MS) {
         learnQueue.set(id, host);
         if (!learnTimer) {
@@ -504,6 +565,8 @@ export function createPrinterFollow({
     stop() {
       if (learnTimer) clearTimeout(learnTimer);
       learnTimer = null;
+      if (recheckTimer) clearTimeout(recheckTimer);
+      recheckTimer = null;
     },
   };
 }

@@ -54,6 +54,7 @@ import { JETBRAINS_MONO } from "./fonts/jetbrains-mono.atlas.mjs";
 import { sendOverTcp } from "./printer-tcp.mjs";
 import { sendOverSpooler } from "./printer-spooler.mjs";
 import { DRAIN_SLOW_MS, DRAIN_TICK_MS, drainDue, drainIntervalMs } from "./drain-poll.mjs";
+import { readPendingJobs } from "./pending-poll.mjs";
 import { createPrinterChains, startJobs } from "./job-queue.mjs";
 import { createPrinterRests, failedJobUpdate } from "./printer-cooldown.mjs";
 import { buildAllowedOrigins, createLanServer } from "./lan-server.mjs";
@@ -1295,6 +1296,7 @@ const channelStatus = new Map(); // restaurant id -> last realtime subscribe sta
 const realtimeJobIds = new Set(); // pending jobs realtime delivered, oldest evicted
 let lastDrainAt = null;
 let lastMissAt = null;
+const pendingPollState = { rpcMissingUntil: 0 };
 
 function noteRealtimeJob(job) {
   if (job.status === "pending") {
@@ -1315,14 +1317,16 @@ async function drainPending() {
   const ids = Array.from(printers.keys()).filter((id) => !rests.isResting(id, now));
   if (ids.length === 0) return;
   const startedAt = performance.now();
-  const { data, error } = await supabase
-    .from("print_jobs")
-    .select("*")
-    .in("restaurant_id", cfg.restaurantIds)
-    .in("printer_id", ids)
-    .eq("status", "pending")
-    .order("created_at", { ascending: true })
-    .limit(20);
+  // 372's pending_print_jobs RPC (direct read until it's applied): the old
+  // read walked each restaurant's whole print history (pending-poll.mjs).
+  const { data, error } = await readPendingJobs(pendingPollState, {
+    supabase,
+    targets: cfg.restaurantIds.map((rid) => ({
+      restaurantId: rid,
+      printerIds: ids.filter((id) => printers.get(id)?.restaurant_id === rid),
+    })),
+    now: startedAt,
+  });
   if (error) {
     log("ERROR draining:", error.message);
     return;

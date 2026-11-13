@@ -10,6 +10,7 @@ import { RasterTextEngine, rasterCellPitch } from "./raster-text.mjs";
 
 const ESC = 0x1b;
 const GS = 0x1d;
+const FS = 0x1c;
 const LF = 0x0a;
 const CODEPAGE_PC858 = 19;
 
@@ -86,7 +87,10 @@ export class EscPos {
   // Loop, never spread: a raster line block is several KB.
   pushAll(b) { for (let i = 0; i < b.length; i++) this.bytes.push(b[i] & 0xff); return this; }
   flushRaster() { if (this.rt) this.pushAll(this.rt.flushPending()); }
-  init() { this.push(ESC, 0x40); this.push(ESC, 0x74, CODEPAGE_PC858); return this; }
+  // FS . cancels Chinese (Kanji) mode before ESC t: generic Chinese printers
+  // keep it on across ESC @ and pair every byte ≥ 0x80 with the next one, so
+  // an accent right before LF ate the line break (mirror of escpos.ts).
+  init() { this.push(ESC, 0x40); this.push(FS, 0x2e); this.push(ESC, 0x74, CODEPAGE_PC858); return this; }
   align(a) {
     if (this.rt) { this.rt.align(a); return this; }
     const n = a === "center" ? 1 : a === "right" ? 2 : 0;
@@ -157,10 +161,11 @@ export class EscPos {
   }
   rule(chars, ch = "-") { return this.line(ch.repeat(chars)); }
   // Two-column line: label flush-left, value flush-right, padded to `width`.
+  // A cut label ends in "." (one column — "…" encodes as "..." on ROM fonts).
   twoCol(label, value, width) {
     const v = value.slice(0, Math.max(0, width - 1));
     const maxLabel = Math.max(0, width - v.length - 1);
-    const l = label.length > maxLabel ? label.slice(0, maxLabel - 1) + "…" : label;
+    const l = label.length > maxLabel ? label.slice(0, maxLabel - 1) + "." : label;
     const pad = width - l.length - v.length;
     return this.line(l + " ".repeat(Math.max(1, pad)) + v);
   }

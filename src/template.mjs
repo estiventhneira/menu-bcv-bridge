@@ -2,7 +2,7 @@
 // Both files render identical bytes for the same payload.
 
 import { EscPos, wrap } from "./escpos.mjs";
-import { rasterColsFor } from "./raster-text.mjs";
+import { rasterColsFor, romColsFor } from "./raster-text.mjs";
 
 const DEFAULT_COLS = 48;
 
@@ -129,12 +129,17 @@ export function renderKitchenTicket(p, cols = DEFAULT_COLS, settings = {}, opts 
   // Letter spacing widens every cell, so the budget is the CELL PITCH, not a
   // bare 12 dots: at `char_spacing` 2 a 48-column line needs 672 dots on a
   // 576-dot head and the tail was thrown away (the COP column of TOTAL EN
-  // MONEDAS first). Spacing 0 ⇒ `paperDots / 12`, exactly as before.
+  // MONEDAS first). Spacing 0 ⇒ `paperDots / 12`, exactly as before. ROM
+  // fonts budget the same way (the printer reflows the overflow onto a second
+  // line); at spacing 0 they keep `cols` untouched.
   const charSpacing = settings.char_spacing ?? 0;
-  const COLS =
-    rasterFont && opts.paperDots
+  const COLS = !opts.paperDots
+    ? rawCols
+    : rasterFont
       ? Math.max(16, Math.min(rawCols, rasterColsFor(opts.paperDots, charSpacing)))
-      : rawCols;
+      : charSpacing > 0
+        ? Math.max(16, Math.min(rawCols, romColsFor(opts.paperDots, settings.font, charSpacing)))
+        : rawCols;
   const COLS_BIG = Math.floor(COLS / 2);
   const esc = new EscPos(
     rasterFont ? { rasterText: { font: rasterFont, cols: COLS, charSpacing } } : {},

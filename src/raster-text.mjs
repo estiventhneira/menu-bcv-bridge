@@ -34,9 +34,8 @@ export const RASTER_LINE_LEADING = 8;
 
 /**
  * Dots one ×1 column advances: the 12-dot cell plus the `ESC SP n` letter
- * spacing that follows it. The ROM path leaned on the printer to reflow a
- * line that no longer fit at a wider pitch; a raster block has no such
- * fallback, so the renderers must budget their columns at THIS width.
+ * spacing that follows it. A raster block cut what ran past the head, so the
+ * renderers must budget their columns at THIS width (ROM: `romColsFor`).
  * Clamped exactly like `RasterTextEngine.charSpacing`.
  */
 export function rasterCellPitch(charSpacing) {
@@ -46,6 +45,20 @@ export function rasterCellPitch(charSpacing) {
 /** Columns of raster text that fit a head of `paperDots` at this spacing. */
 export function rasterColsFor(paperDots, charSpacing) {
   return Math.floor(Math.max(0, paperDots) / rasterCellPitch(charSpacing));
+}
+
+/**
+ * Columns of ROM-font text that fit a head of `paperDots` at this spacing.
+ * The printer's reflow is not a fallback either: a 48-column line at +1 is
+ * 624 dots on a 576-dot head, so every rule, «Subtotal» and TOTAL EN MONEDAS
+ * row printed as a full line plus a 4-character one (Pronto Gourmet,
+ * 2026-11-11). Font B cells are 9 dots; Font C varies by model, so it budgets
+ * at Font A's 12 (never more columns than fit).
+ */
+export function romColsFor(paperDots, font, charSpacing) {
+  const cellW = font === "B" ? 9 : RASTER_CELL_W;
+  const spacing = Math.max(0, Math.min(255, Math.round(charSpacing) || 0));
+  return Math.floor(Math.max(0, paperDots) / (cellW + spacing));
 }
 
 /**

@@ -559,6 +559,12 @@ Printers behind a router (another subnet) have no ARP entry, so they're never
 followed. Console lines to look for: `MAC … en …`, `la impresora cambió de IP
 — … → …`.
 
+0.9.3: while a printer is reported as refusing or not answering, the bridge
+tries its port once a minute (one TCP connect, 750 ms timeout) and clears the
+report as soon as the printer's own card answers there, instead of at its
+next ticket. An IP conflict still waits for a good print. Console line:
+`volvió a responder en …`.
+
 ## Security note
 
 Since 0.3.0 the bridge authenticates as a **per-device auth account**
