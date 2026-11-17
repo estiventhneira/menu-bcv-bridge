@@ -27,6 +27,10 @@
  * (printer-follow.mjs) and reports why a printer isn't answering
  * (bridge_tokens.printer_status, migration 366).
  *
+ * 0.9.4 keeps printing when another device takes a printer's IP: the
+ * installer's helper pins that IP to the printer's MAC on this PC
+ * (arp-pin.mjs; Windows, installer run as administrator).
+ *
  * One process can drive many printers across one or more restaurants on the
  * same PC (e.g. a restaurant and its sucursal): run `pair` once per
  * restaurant — the same device account accumulates them.
@@ -44,6 +48,7 @@ import { runPair } from "./pair.mjs";
 import { startDiscovery, isConnectionError, probe } from "./discover.mjs";
 import { readArpTable } from "./arp.mjs";
 import { createPrinterFollow } from "./printer-follow.mjs";
+import { createArpPins } from "./arp-pin.mjs";
 import { startSelfUpdate } from "./self-update.mjs";
 import { disableQuickEdit } from "./console-mode.mjs";
 import { VERSION } from "./version.mjs";
@@ -161,6 +166,10 @@ const PRINTER_CACHE_FILE = path.join(STATE_DIR, "cache", "printers.json");
 // (0.9.2) — see printer-follow.mjs. Both auth modes: the follow is local;
 // only its report to the app needs a device account.
 const FOLLOW_FILE = path.join(STATE_DIR, "cache", "printer-follow.json");
+// 0.9.4: when another device takes a printer's IP, the installer's helper
+// pins that IP to the printer's MAC on this PC — see arp-pin.mjs. Windows,
+// and only where the installer ran as administrator.
+const arpPins = createArpPins({ log });
 const follow = createPrinterFollow({
   readArp: () => readArpTable(),
   probe,
@@ -171,6 +180,7 @@ const follow = createPrinterFollow({
     scheduleStatusReport();
   },
   nameOf: (id) => printers.get(id)?.name ?? id.slice(0, 8),
+  pins: arpPins,
   saved: loadFollowCache(FOLLOW_FILE),
   log,
 });
@@ -1386,6 +1396,11 @@ function schedulePrintersRefresh() {
 
 async function main() {
   log(`fujun-bridge v${VERSION} starting (label=${cfg.label}, mode=${cfg.mode}, restaurants=${cfg.restaurantIds.join(", ")})`);
+  if (arpPins.supported) {
+    log(arpPins.available()
+      ? "arp-pin: activo — si otro equipo toma la IP de una impresora, el bridge la fija a su MAC en esta PC"
+      : "arp-pin: sin ayudante — para que el bridge siga imprimiendo cuando otro equipo toma la IP de una impresora, vuelve a correr el instalador como administrador");
+  }
   // Self-update runs in BOTH auth modes — it's what carries legacy installs
   // forward too. Applies only between prints, never mid-ticket (LAN tickets
   // included: they share inFlight, and queued ones survive the restart).
@@ -1539,6 +1554,7 @@ async function main() {
     log("shutting down…");
     discovery?.stop();
     follow.stop();
+    arpPins.stop();
     lanEndpoints?.stop();
     uploader?.stop();
     for (const channel of channels) {

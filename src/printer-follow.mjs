@@ -30,6 +30,15 @@
 // printer's next ticket: Pronto Gourmet's Dolce (a few dessert comandas a
 // day) still said «La impresora no responde» hours after it was back
 // (2026-11-11).
+//
+// 0.9.4: a printer whose IP another device took isn't lost, only hidden: the
+// PC sends its tickets to the other device (Xing Wah's «Cocina», 2026-11-17:
+// a fixed 172.16.0.22 the router also gave away, 30+ comandas expired). When
+// the installer's helper is on this PC (arp-pin.mjs), the bridge asks it to
+// pin that IP to the printer's MAC and keeps printing. The pin is a try, not
+// a fix: it's dropped when the printer still doesn't answer, when the printer
+// is found at another IP, and when someone edits the row; the report says
+// `pin: "on"` so the printers page still asks for the router to be fixed.
 
 /** Re-read a printer's MAC after a good print at most this often — also how
  *  soon a DHCP swap (its IP now reaching another printer) is noticed. */
@@ -50,13 +59,26 @@ export const RECHECK_MS = 60_000;
  * replaced printer shows its card every time.
  */
 export const MISMATCH_CONFIRM = 3;
+/** A pin the printer hasn't answered through for this long is dropped: the
+ *  printer is off or gone, and a pin left behind would hide whatever is put
+ *  at that IP next. */
+export const PIN_GIVE_UP_MS = 4 * 60_000;
+/** How long before pinning again after giving up: the 1st, 2nd and every
+ *  later time in a row. While pinned, the other device can't reach this PC. */
+export const PIN_RETRY_STEPS_MS = [5 * 60_000, 15 * 60_000, 60 * 60_000];
+/** The helper applies a pin within a minute or so: the printer's jobs wait
+ *  that long instead of spending attempts. */
+export const PIN_SETTLE_MS = 2 * 60_000;
 
 /**
  * One printer in the report (bridge-printer-status.ts parses it app-side).
+ * `pin` (0.9.4, Windows only): "on" = its IP is pinned to its MAC on this PC,
+ * "ready" = the helper is installed, "missing" = it isn't.
  * @typedef {{
  *   host: string, port: number, mac: string | null, followed_host: string | null,
  *   state: string, host_mac: string | null, other_printer_id: string | null,
  *   since: string | null, checked_at: string | null,
+ *   pin?: "on" | "ready" | "missing",
  * }} PrinterStatusEntry
  */
 
@@ -95,6 +117,14 @@ function blankEntry() {
     mismatch_mac: null,
     mismatch_count: 0,
     mismatch_scanned: false,
+    // The pin (0.9.4). Never persisted either: a restarted bridge finds out
+    // again whether the IP is still in dispute.
+    pin_at: null,
+    pin_host: null,
+    pin_other_mac: null,
+    pin_fail_since: null,
+    pin_gave_up_at: null,
+    pin_give_ups: 0,
   };
 }
 
@@ -104,6 +134,19 @@ function forgetCard(e) {
   e.state = e.since = e.host_mac = e.other_printer_id = null;
   e.locate_requested_at = e.located_at = null;
   clearMismatch(e);
+  clearPin(e);
+  forgetPinTries(e);
+}
+
+function clearPin(e) {
+  e.pin_at = e.pin_host = e.pin_other_mac = e.pin_fail_since = null;
+}
+
+/** The printer answered (or is someone else's question now): the next pin
+ *  doesn't wait. */
+function forgetPinTries(e) {
+  e.pin_gave_up_at = null;
+  e.pin_give_ups = 0;
 }
 
 function clearMismatch(e) {
@@ -147,6 +190,7 @@ function loadEntries(saved) {
  *   onFollow: (printerId: string, host: string, from: string | null) => void,
  *   onChange: () => void,
  *   nameOf?: (printerId: string) => string,
+ *   pins?: { supported: boolean, available: () => boolean, sync: (pins: Map<string, string>) => boolean } | null,
  *   saved?: unknown,
  *   now?: () => number,
  *   log?: (msg: string) => void,
@@ -159,6 +203,7 @@ export function createPrinterFollow({
   onFollow,
   onChange,
   nameOf = (id) => id.slice(0, 8),
+  pins = null,
   saved = null,
   now = () => Date.now(),
   log = () => {},
@@ -208,11 +253,68 @@ export function createPrinterFollow({
     return null;
   }
 
+  /** Hand the helper the pins wanted right now (IP → the printer's MAC). */
+  function syncPins() {
+    if (!pins) return;
+    const want = new Map();
+    for (const e of printers.values()) {
+      if (e.pin_at && e.pin_host && e.mac) want.set(e.pin_host, e.mac);
+    }
+    try {
+      pins.sync(want);
+    } catch (err) {
+      logOnce(`follow: no se pudo pedir la fijación de IP (${err.message})`);
+    }
+  }
+
+  /**
+   * Another device's card answers at the printer's IP: ask the helper to pin
+   * that IP to the printer's own card on this PC. Not for a swap between two
+   * of the restaurant's printers (the scan follows those), and not again
+   * right after a pin that didn't help.
+   */
+  function requestPin(id, e, host) {
+    if (e.pin_at || !e.mac || !e.host_mac || e.other_printer_id || !pins?.available()) return;
+    const t = now();
+    if (e.pin_gave_up_at) {
+      const wait = PIN_RETRY_STEPS_MS[Math.min(e.pin_give_ups, PIN_RETRY_STEPS_MS.length) - 1];
+      if (t - e.pin_gave_up_at < wait) return;
+    }
+    e.pin_at = t;
+    e.pin_host = host;
+    e.pin_other_mac = e.host_mac;
+    e.pin_fail_since = t;
+    log(`${nameOf(id)}: otro equipo (${e.host_mac}) responde en ${host} — fijo esa IP a la MAC de la impresora (${e.mac}) en esta PC`);
+    syncPins();
+    onChange();
+    armRecheck();
+  }
+
+  /** Returns whether there was a pin. The caller reports the change. */
+  function dropPin(e) {
+    if (!e.pin_at) return false;
+    clearPin(e);
+    syncPins();
+    return true;
+  }
+
+  /** The printer hasn't answered through its pin for PIN_GIVE_UP_MS. */
+  function giveUpPin(id, e) {
+    if (!e.pin_at || !e.pin_fail_since || now() - e.pin_fail_since < PIN_GIVE_UP_MS) return false;
+    log(`${nameOf(id)}: fijé ${e.pin_host} a su MAC y sigue sin responder — quito la fijación`);
+    e.pin_gave_up_at = now();
+    e.pin_give_ups += 1;
+    return dropPin(e);
+  }
+
   function follow(id, host) {
     const e = printers.get(id);
     if (!e) return;
     const from = currentHost(e);
     const t = now();
+    // Found at another IP: its old one is the other device's to keep.
+    dropPin(e);
+    forgetPinTries(e);
     if (host === e.configured_host) {
       e.followed_host = e.followed_from = e.followed_at = null;
       e.state = "ok";
@@ -282,6 +384,7 @@ export function createPrinterFollow({
     if (e.mismatch_count < MISMATCH_CONFIRM || !e.mismatch_scanned) return false;
     // A replaced printer at the same IP (or the row re-pointed outside the app).
     log(`${nameOf(id)}: MAC nueva ${mac} en ${host} (antes ${e.mac})`);
+    dropPin(e);
     e.mac = mac;
     e.mac_host = host;
     e.learned_at = now();
@@ -334,6 +437,7 @@ export function createPrinterFollow({
       onChange();
     }
     armRecheck();
+    if (state === "conflict") requestPin(id, e, host);
     // Fast path: the card already sits at another IP in the table.
     if (!e.mac) return;
     const elsewhere = [...table].filter(([ip, mac]) => mac === e.mac && ip !== host).map(([ip]) => ip);
@@ -356,6 +460,10 @@ export function createPrinterFollow({
 
   /** Down, and its IP not in dispute (then the state is the learner's call). */
   const isDown = (e) => DOWN_STATES.has(e.state) && !e.mismatch_mac;
+  /** Its IP is in dispute and a pin was asked for: once the helper applies
+   *  it, the printer's own card answers there. */
+  const pinPending = (e) => !!e.pin_at && e.state === "conflict";
+  const wantsRecheck = (e) => isDown(e) || pinPending(e);
 
   /**
    * Whether the printer itself answers at `host`. One with no card learned
@@ -369,9 +477,10 @@ export function createPrinterFollow({
     return !hostMac || !printerWithMac(hostMac, id, host);
   }
 
-  /** Runs while some printer is down, and stops by itself. */
+  /** Runs while some printer is down or waits for its pin, and stops by
+   *  itself. */
   function armRecheck() {
-    if (recheckTimer || ![...printers.values()].some(isDown)) return;
+    if (recheckTimer || ![...printers.values()].some(wantsRecheck)) return;
     recheckTimer = setTimeout(() => {
       runRecheck().catch((err) => log(`follow: ${err.message}`));
     }, RECHECK_MS);
@@ -382,12 +491,18 @@ export function createPrinterFollow({
     recheckTimer = null;
     let changed = false;
     for (const [id, e] of printers) {
-      if (!isDown(e)) continue;
+      if (!wantsRecheck(e)) continue;
       const host = currentHost(e);
-      if (!host || !(await answersAt(id, e, host))) continue;
+      if (!host || !(await answersAt(id, e, host))) {
+        // No ticket may come to say so: a pin that doesn't help ends here.
+        if (printers.get(id) === e && giveUpPin(id, e)) changed = true;
+        continue;
+      }
       // A print or an edit may have settled it while the probe was out.
-      if (printers.get(id) !== e || currentHost(e) !== host || !isDown(e)) continue;
+      if (printers.get(id) !== e || currentHost(e) !== host || !wantsRecheck(e)) continue;
       e.checked_at = now();
+      e.pin_fail_since = null;
+      forgetPinTries(e);
       markAnswering(e);
       log(`${nameOf(id)}: volvió a responder en ${host}`);
       changed = true;
@@ -398,6 +513,9 @@ export function createPrinterFollow({
 
   // A problem saved before a restart may be over by now.
   armRecheck();
+  // And a pin the last run asked for is dropped: this run asks again if the
+  // IP is still in dispute.
+  syncPins();
 
   return {
     /**
@@ -424,9 +542,12 @@ export function createPrinterFollow({
         } else {
           forgetCard(e);
         }
+        syncPins();
         onChange();
       } else if (!e.followed_host && before && before !== rowHost) {
+        // The pin was for the old IP.
         forgetCard(e);
+        syncPins();
         onChange();
       }
       return currentHost(e);
@@ -442,7 +563,10 @@ export function createPrinterFollow({
           dropped = true;
         }
       }
-      if (dropped) onChange();
+      if (dropped) {
+        syncPins();
+        onChange();
+      }
     },
 
     /** A job just printed at `host`. */
@@ -452,6 +576,8 @@ export function createPrinterFollow({
       const t = now();
       e.checked_at = t;
       e.locate_requested_at = null;
+      e.pin_fail_since = null;
+      forgetPinTries(e);
       // While another card answers here, the state is the learner's call.
       if (!e.mismatch_mac && markAnswering(e)) onChange();
       if (!e.mac || e.mismatch_mac || e.mac_host !== host || t - (e.learned_at ?? 0) >= RELEARN_MS) {
@@ -476,6 +602,10 @@ export function createPrinterFollow({
       const t = now();
       if (!PROBLEM_STATES.has(e.state)) e.since = t;
       e.checked_at = t;
+      if (e.pin_at) {
+        e.pin_fail_since ??= t;
+        if (giveUpPin(id, e)) onChange();
+      }
       // Urgent until a scan that started after the problem began is done;
       // after that it's searched for at discovery's normal pace.
       const urgent = !!e.mac && !(e.located_at >= e.since);
@@ -511,16 +641,22 @@ export function createPrinterFollow({
     },
 
     /** Its jobs should wait instead of spending attempts: the bridge is
-     *  searching for it right now (bounded by LOCATE_WINDOW_MS). */
+     *  searching for it right now (bounded by LOCATE_WINDOW_MS), or just
+     *  asked for its IP to be pinned (PIN_SETTLE_MS). */
     isLocating(id) {
-      const at = printers.get(id)?.locate_requested_at;
-      return !!at && now() - at < LOCATE_WINDOW_MS;
+      const e = printers.get(id);
+      if (!e) return false;
+      const t = now();
+      if (e.pin_at && e.pin_fail_since && t - e.pin_at < PIN_SETTLE_MS) return true;
+      const at = e.locate_requested_at;
+      return !!at && t - at < LOCATE_WINDOW_MS;
     },
 
     /** For bridge_report_printer_status (migration 366). */
     report() {
       /** @type {Record<string, PrinterStatusEntry>} */
       const out = {};
+      const helper = pins?.supported ? (pins.available() ? "ready" : "missing") : null;
       for (const [id, e] of printers) {
         if (!e.configured_host || (!e.mac && !e.state)) continue;
         out[id] = {
@@ -529,10 +665,13 @@ export function createPrinterFollow({
           mac: e.mac,
           followed_host: e.followed_host,
           state: e.state ?? "ok",
-          host_mac: e.host_mac,
+          // A pinned printer answers again, and the page still names the
+          // device it shares its IP with.
+          host_mac: e.host_mac ?? (e.pin_at ? e.pin_other_mac : null),
           other_printer_id: e.other_printer_id,
           since: iso(e.since),
           checked_at: iso(e.checked_at),
+          ...(helper ? { pin: e.pin_at ? "on" : helper } : {}),
         };
       }
       return { v: 1, printers: out };

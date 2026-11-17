@@ -270,7 +270,7 @@ journalctl -u fujun-bridge -f   # follow logs
 | `spooler 'POS-80': exit 1 — Win32 error 5` | "Access denied." The bridge process can't see the printer because it's installed for a different Windows user. Either reinstall the printer as "Share this printer" → "Render print jobs on client computers", or run the bridge as the same user who installed the printer. |
 | Garbled text prints | The OS printer is configured with a vendor driver that intercepts the bytes. Reinstall it with the **Generic / Text Only** driver. |
 | `realtime: CONNECTING` (never SUBSCRIBED) | No internet, wrong `supabase_url`, or wrong key. |
-| `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. 0.9.2+: the printers page says what answered at that IP — another device's MAC there means an IP conflict (set the printer to DHCP, or reserve its IP on the router with the MAC shown). |
+| `ECONNREFUSED` / `ETIMEDOUT` on print | Printer powered off, wrong IP, or printer on a different LAN than the bridge PC. Verify: `nc -vz <printer-ip> 9100`. 0.9.2+: the printers page says what answered at that IP — another device's MAC there means an IP conflict (set the printer to DHCP, or reserve its IP on the router with the MAC shown). 0.9.4+ on Windows, installed as administrator: the bridge pins the IP to the printer's MAC and keeps printing meanwhile (see "Printing through an IP conflict"). |
 | Jobs queue but never print | Bridge isn't running, or printer is `is_active=false` in the DB. |
 | Windows: jobs queue for hours, then everything prints the moment you press **Enter** in the bridge window (`CHANNEL_ERROR` → `SUBSCRIBED`) | Someone clicked inside the console: QuickEdit "Select" mode blocks every console write, which freezes the whole process. 0.5.3+ turns QuickEdit off on its own console at start. On older builds: right-click the title bar → *Propiedades* → untick *Modo de edición rápida*, or `reg add HKCU\Console /v QuickEdit /t REG_DWORD /d 0 /f`. |
 | App shows `bridge desactualizado` / an old version on a printer | That PC is running an older binary. Builds ≥ 0.5.0 self-update within ~6 h of a release (see Self-update below); older ones don't: re-download from the table above, replace the file, and restart the service. The running version is also printed on the bridge's first log line. |
@@ -564,6 +564,54 @@ tries its port once a minute (one TCP connect, 750 ms timeout) and clears the
 report as soon as the printer's own card answers there, instead of at its
 next ticket. An IP conflict still waits for a good print. Console line:
 `volvió a responder en …`.
+
+## Printing through an IP conflict (0.9.4, Windows)
+
+A printer with a fixed IP that the router also hands to another device isn't
+gone, only hidden: the PC's ARP entry for that IP points at the other device,
+which refuses the tickets (Xing Wah, 2026-11-17: 30+ comandas expired). The
+follow can't help, because the printer never moved.
+
+When the bridge sees another device's MAC at a printer's IP (and knows the
+printer's own MAC from an earlier good print), it asks for that IP to be
+pinned to the printer's MAC on this PC: a static neighbor entry, so the PC
+talks to the printer whatever else answers there. Writing one needs
+administrator rights and the bridge runs as a normal user, so
+`install.ps1` **run as administrator** installs a helper:
+
+- `C:\ProgramData\FujunPrintBridge\bin\` (administrators only): the helper
+  script, its state and its log (`arp-helper.log`).
+- `C:\ProgramData\FujunPrintBridge\arp\pins.txt`: the pins the bridge wants,
+  one `ip mac` per line. The bridge writes it; no file means nothing pinned.
+- Task `Fujun Print Bridge ARP`: runs as SYSTEM once a minute. It starts
+  PowerShell only while that file or a pin exists.
+
+The helper checks every line again: the IP has to be a host on one of the
+PC's networks, never the PC's own address, its router or its DNS/DHCP server,
+and the MAC has to be unicast. It only removes entries it added.
+
+Nothing is permanent. Entries are not persistent (a PC restart clears them),
+the helper drops them when `pins.txt` is 15 min old (the bridge rewrites it
+every 5 min while it wants a pin), and the bridge lets go of a pin when:
+
+- the printer doesn't answer through it for 4 min (it's off or gone); it then
+  waits 5, 15 and 60 min before trying again;
+- the printer turns up at another IP, or someone edits or deletes the row;
+- the bridge restarts (it asks again if the IP is still in dispute, so a
+  restart costs a minute or two of waiting comandas).
+
+While an IP is pinned, the other device at that IP can't reach this PC (a
+tablet there falls back to printing through the internet). The printers page
+says «Otro equipo usa la IP …; la impresora sigue imprimiendo» and still asks
+for the real fix: DHCP on the printer, or a reservation on the router. On a
+PC without the helper it says to re-run the install command as administrator.
+
+Console lines: `arp-pin: activo` / `arp-pin: sin ayudante` at start,
+`fijo esa IP a la MAC de la impresora`, `quito la fijación`. To remove the
+helper: `schtasks /Delete /F /TN "Fujun Print Bridge ARP"` and delete
+`C:\ProgramData\FujunPrintBridge` (both as administrator). It can't be tested
+off Windows: the unit tests cover the bridge's rules and the file it writes,
+not the PowerShell helper.
 
 ## Security note
 
