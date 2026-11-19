@@ -31,7 +31,7 @@ import {
   partialPaymentCommand,
   widthsForFlag21,
 } from "./hka-commands.mjs";
-import { normalizeRif, parseS1, parseS2, parseS3, parseSV } from "./hka-parse.mjs";
+import { isTaxIncluded, normalizeRif, parseS1, parseS2, parseS3, parseSV } from "./hka-parse.mjs";
 
 /** SV model code of the ACLAS PP9-PLUS. */
 export const PP9_PLUS_MODEL = "ZZP";
@@ -99,7 +99,7 @@ export function spread(total, weights) {
  * @param {import("./hka-commands.mjs").Widths} w
  */
 export function machineLines(items, totalCents, rate, w) {
-  const included = rate.type === 2;
+  const included = isTaxIncluded(rate.type);
   const targets = included
     ? items.map((it) => it.gross_cents)
     : spread(netBaseFor(totalCents, rate.bp).base, items.map((it) => it.gross_cents));
@@ -125,6 +125,8 @@ export function machineLines(items, totalCents, rate, w) {
  *   docNumber?: number | null, zNumber?: number | null,
  *   totals?: { total_cents: number, base_cents: number, tax_cents: number, exempt_cents: number, rate_bp: number } | null,
  *   error?: string, message?: string, reviewReason?: string, warnings?: string[],
+ *   mismatch?: { machine_due_cents: number, machine_base_cents: number, machine_tax_cents: number,
+ *     plan_total_cents: number, expected_cents: number, tax_type: number, rate_bp: number },
  * }} InvoiceOutcome
  *
  *   printed       the factura is on the machine with docNumber
@@ -160,6 +162,11 @@ async function idleClosingNoFiscal(session, maxMs) {
     st = await session.waitIdle({ maxMs });
   }
   return st;
+}
+
+/** 175287 → "1752,87" (the machine's own format, no thousands mark). */
+function bs(cents) {
+  return (cents / 100).toFixed(2).replace(".", ",");
 }
 
 function blocked(error, message) {
@@ -266,8 +273,24 @@ export async function runInvoice(session, plan, hooks = {}) {
     return abortBeforePayment(session, ctx, "timeout");
   }
   if (Math.abs(s2.dueCents - plan.total_cents) > totalTolerance(plan.total_cents)) {
-    hooks.log?.(`fiscal: total de la máquina ${s2.dueCents} ≠ plan ${plan.total_cents} (esperado ${lines.expectedTotal})`);
-    return abortBeforePayment(session, ctx, "total_mismatch");
+    // Kept in the outcome (the job file on the PC) and the message: the
+    // console window is the only other place these figures ever appear.
+    const mismatch = {
+      machine_due_cents: s2.dueCents,
+      machine_base_cents: s2.baseCents,
+      machine_tax_cents: s2.taxCents,
+      plan_total_cents: plan.total_cents,
+      expected_cents: lines.expectedTotal,
+      tax_type: rate.type,
+      rate_bp: rate.bp,
+    };
+    hooks.log?.(
+      `fiscal: total de la máquina ${s2.dueCents} (base ${s2.baseCents} + IVA ${s2.taxCents}) ≠ plan ${plan.total_cents}` +
+        ` (esperado ${lines.expectedTotal}, tasa tipo ${rate.type})`,
+    );
+    const out = await abortBeforePayment(session, ctx, "total_mismatch");
+    const figures = ` (máquina Bs ${bs(s2.dueCents)}, cobro Bs ${bs(plan.total_cents)})`;
+    return { ...out, mismatch, ...(out.error === "total_mismatch" ? { message: `${out.message}${figures}` } : {}) };
   }
   ctx.totals = {
     total_cents: s2.dueCents,

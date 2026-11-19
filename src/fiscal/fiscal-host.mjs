@@ -314,7 +314,16 @@ export function createFiscalHost(deps) {
         log,
         onStep: (step, data) => {
           rec.step = step;
-          if (step === "body") rec.started = { lastFactura: data.lastFactura, zCounter: data.zCounter, flag21: data.flag21, flag50: data.flag50 };
+          if (step === "body") {
+            rec.started = {
+              lastFactura: data.lastFactura,
+              zCounter: data.zCounter,
+              flag21: data.flag21,
+              flag50: data.flag50,
+              taxType: data.rate?.type ?? null,
+              rateBp: data.rate?.bp ?? null,
+            };
+          }
           if (step === "paying") rec.totals = data.totals;
           journal.save(rec); // durable before the next command goes out
         },

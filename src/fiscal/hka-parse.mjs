@@ -160,10 +160,23 @@ export function parseS2(data, prefix = "S2") {
 }
 
 /**
+ * What an S3 tax type means for item prices. The manuals disagree (spec
+ * §3.3: PT says 1 = excluida, the S3 legend says 1 = Incluido, 2 =
+ * Excluido); the S3 legend is the one the hardware follows. Roraima's
+ * PP9-PLUS ZZP0008447 (2026-11-19) reports type 2 and adds IVA on top of
+ * the item prices: read as IVA-included, two facturas came out 16 % over
+ * the sale and were voided (0002216, 0002217).
+ * @param {number} type
+ * @returns {boolean} true when the machine takes item prices IVA-included
+ */
+export function isTaxIncluded(type) {
+  return type === 1;
+}
+
+/**
  * S3 — tax rates and the 64 flags (spec §3.3). A rate field is
- * type(1) + rate(4 = 2+2): "11600" = type 1, 16.00 %. Type 1 is read as
- * "price excludes IVA" (the PT definition; the manual's own invoice example
- * prices items net under PT1) — hardware checklist item 9.
+ * type(1) + rate(4 = 2+2): "21600" = type 2, 16.00 %. See isTaxIncluded
+ * for what the type means.
  * @param {Uint8Array} data
  */
 export function parseS3(data) {

@@ -43,6 +43,9 @@ export function buildFrame(data) {
 const TRANSLIT = new Map([
   ["‘", "'"], ["’", "'"], ["‚", "'"], ["“", '"'], ["”", '"'],
   ["„", '"'], ["–", "-"], ["—", "-"], ["…", "..."], ["€", "EUR"],
+  // Latin-1 0xB7, but the PP9-PLUS prints it as "?" (Roraima, 2026-11-19;
+  // Ñ prints fine).
+  ["·", "-"],
   ["•", "-"], [" ", " "],
 ]);
 

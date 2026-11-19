@@ -8,7 +8,8 @@
 // It models what the protocol spec documents: STS1/STS2, S1/S2/S3/SV
 // replies, the factura state machine (customer lines → items → 3 → payments
 // → close, 7 only before any payment), flag 21 widths, flag 50 (199
-// mandatory), tax type 1 = price excludes IVA / 2 = includes it, documentos
+// mandatory), tax type 1 = price includes IVA / 2 = excludes it (S3 legend,
+// as Roraima's real PP9-PLUS behaves — hka-parse.mjs isTaxIncluded), documentos
 // no fiscales and Reporte X. Faults can be injected per command: NAK,
 // swallowed (busy), executed-but-unanswered, paper out, and a crash after N
 // commands (the cable pulled; reconnect() keeps the open document, as the
@@ -17,6 +18,7 @@
 import { ACK, NAK, buildFrame, decodeLatin1, replyBytes } from "./hka-frame.mjs";
 import { createFrameReader } from "./hka-reader.mjs";
 import { assertAllowed, widthsForFlag21 } from "./hka-commands.mjs";
+import { isTaxIncluded } from "./hka-parse.mjs";
 
 const PRINTING = /^(?:3|2\d{2}\d+|1\d{2}|7|81.*|I0X)$/;
 const RATE_INDEX = { " ": 0, "!": 1, '"': 2, "#": 3, "$": 4 };
@@ -52,10 +54,11 @@ export function createHkaSimulator(opts = {}) {
     model: "ZZP",
     mode: opts.mode ?? "fiscal",
     flags,
+    // Type 2 (IVA excluded), as Roraima's ZZP0008447 reports.
     rates: opts.rates ?? [
-      { type: 1, bp: 1600 },
-      { type: 1, bp: 800 },
-      { type: 1, bp: 3100 },
+      { type: 2, bp: 1600 },
+      { type: 2, bp: 800 },
+      { type: 2, bp: 3100 },
     ],
     counters: {
       factura: opts.lastFactura ?? 100,
@@ -127,7 +130,7 @@ export function createHkaSimulator(opts = {}) {
       const r = state.rates[idx - 1];
       const a = BigInt(amt);
       const bp = BigInt(r.bp);
-      const included = opts.taxSemantics ? opts.taxSemantics === "included" : r.type === 2;
+      const included = opts.taxSemantics ? opts.taxSemantics === "included" : isTaxIncluded(r.type);
       // Tax on the ACCUMULATED base per rate (spec §4.2).
       const t = included ? Number(divRound(a * bp, 10000n + bp)) : Number(divRound(a * bp, 10000n));
       const b = included ? amt - t : amt;
