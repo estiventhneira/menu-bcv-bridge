@@ -8,6 +8,7 @@
 import os from "node:os";
 import { createClient } from "@supabase/supabase-js";
 import { configPath, readConfigRaw, saveConfigRaw } from "./config.mjs";
+import { buildPairedConfig } from "./pair-config.mjs";
 
 const DEFAULT_APP_URL = "https://andescocina.com";
 
@@ -86,42 +87,19 @@ export async function runPair(args) {
   try {
     appOrigin = new URL(url).origin;
   } catch {}
-  const withLan = (cfg) => {
-    const out = { ...cfg, ...(appOrigin ? { app_origin: appOrigin } : {}) };
-    if (typeof body.lan_secret === "string" && body.lan_secret) {
-      const others = (Array.isArray(cfg.lan_secrets) ? cfg.lan_secrets : [])
-        .filter((x) => x?.bridge_token_id !== body.bridge_token_id);
-      out.lan_secrets = [
-        ...others,
-        { bridge_token_id: body.bridge_token_id, restaurant_id: body.restaurant_id, lan_secret: body.lan_secret },
-      ];
-    }
-    return out;
-  };
 
-  let raw;
-  if (existingAccessToken && existingIsDevice) {
-    // Append the new restaurant to the existing device config.
-    const restaurants = Array.isArray(existing.restaurants) ? existing.restaurants : [];
-    if (!restaurants.some((r) => r?.id === body.restaurant_id)) {
-      restaurants.push({ id: body.restaurant_id, bridge_token_id: body.bridge_token_id });
-    }
-    raw = withLan({ ...existing, restaurants });
-  } else {
-    if (existing && !existingIsDevice) {
-      console.warn("Reemplazando config antigua (service role key). Si esta PC imprimía para otras sucursales, generá un código en cada una y repetí `pair`.");
-    }
-    raw = withLan({
-      supabase_url: body.supabase_url,
-      anon_key: body.anon_key,
-      device_email: body.device_email,
-      device_password: body.device_password,
-      restaurants: [{ id: body.restaurant_id, bridge_token_id: body.bridge_token_id }],
-      label,
-    });
+  const reuseDevice = !!existingAccessToken && existingIsDevice;
+  if (!reuseDevice && existing && !existingIsDevice) {
+    console.warn("Reemplazando config antigua (service role key). Si esta PC imprimía para otras sucursales, generá un código en cada una y repetí `pair`.");
   }
+  // A new device account keeps this PC's settings and the máquina fiscal
+  // saved for this restaurant (pair-config.mjs).
+  const raw = buildPairedConfig(existing, body, { label, appOrigin, reuseDevice });
 
   const p = saveConfigRaw(raw);
   console.log(`Listo: bridge vinculado (${raw.restaurants.length} restaurante(s)). Config: ${p}`);
+  if (!reuseDevice && Array.isArray(raw.fiscal_machines) && raw.fiscal_machines.length > 0) {
+    console.log(`Máquina fiscal conservada: ${raw.fiscal_machines.map((m) => `${m.registro} (${m.port})`).join(", ")}`);
+  }
   console.log("Iniciá el bridge (o reiniciá el servicio) para empezar a imprimir.");
 }
