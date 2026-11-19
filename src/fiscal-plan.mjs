@@ -12,6 +12,18 @@
 //   receipt  app → bridge   "these results are recorded" — stops the bridge
 //                           listing them as unrecorded
 //
+// 0.9.6: a nota de crédito (full reversal of a machine factura) is a plan
+// and a result with v = 2 and doc = "nota_credito". Bridges ≤ 0.9.5 check
+// v === 1, so they refuse it instead of printing it as a factura; this
+// bridge takes it only on /lan/v1/fiscal/credit-note (validateCreditPlan),
+// and /lan/v1/fiscal/invoice refuses it.
+//
+// 0.9.6 (392): an item may carry `tax: "E"` (exento; absent = "G", tasa
+// general): the propina as its own line, when the restaurant asks for it.
+// A factura plan with an exento line is v = 3, so a bridge ≤ 0.9.5 (which
+// ignores `tax`) refuses it instead of printing the propina with IVA. Its
+// result is still v = 1.
+//
 // Format: f1.<kind>.<base64url(JSON)>.<base64url(HMAC-SHA256)>, the MAC taken
 // over "f1.<kind>.<body>" — the kind is inside the MAC, so a result can't be
 // replayed as a receipt, and none of them as a LAN token (different version
@@ -97,14 +109,60 @@ const int = (x, min, max) => Number.isSafeInteger(x) && x >= min && x <= max;
 const strList = (x, maxItems, maxLen) =>
   x === undefined || (Array.isArray(x) && x.length <= maxItems && x.every((s) => str(s, maxLen)));
 
+/** "19/11/2026" — the affected factura's date as the NC header prints it. */
+export const FISCAL_CREDIT_DATE_RE = /^(0[1-9]|[12][0-9]|3[01])\/(0[1-9]|1[0-2])\/(20[0-9]{2})$/;
+
+/** 0.9.6 (392): a line's rate on the machine. Absent = "G" (D1). */
+export const FISCAL_ITEM_TAXES = new Set(["G", "E"]);
+/** 0.9.6 (392): the factura plan version that may carry exento lines. */
+export const FISCAL_PLAN_V_EXEMPT = 3;
+
+/** Does the plan carry an exento line? */
+export function planHasExemptLine(p) {
+  return Array.isArray(p?.items) && p.items.some((it) => it?.tax === "E");
+}
+
 /**
- * Strict shape check of a factura plan.
+ * Strict shape check of a factura plan: v = 1, or v = 3 when (and only
+ * when) a line is exento.
  * @returns {{ ok: true, plan: object } | { ok: false, error: string }}
  */
 export function validatePlan(p) {
+  if (!p || typeof p !== "object" || Array.isArray(p)) return { ok: false, error: "plan" };
+  if ((p.v !== 1 && p.v !== FISCAL_PLAN_V_EXEMPT) || (p.doc !== undefined && p.doc !== "factura")) {
+    return { ok: false, error: "version" };
+  }
+  if (planHasExemptLine(p) !== (p.v === FISCAL_PLAN_V_EXEMPT)) return { ok: false, error: "version" };
+  return validateBody(p);
+}
+
+/**
+ * Strict shape check of a nota de crédito plan (v = 2, 0.9.6): the factura
+ * plan's body plus the affected factura (number, date, registro of the
+ * machine that printed it — the NC header the machine requires) and a
+ * customer RIF / name, both mandatory on an NC.
+ * @returns {{ ok: true, plan: object } | { ok: false, error: string }}
+ */
+export function validateCreditPlan(p) {
   const fail = (error) => ({ ok: false, error });
   if (!p || typeof p !== "object" || Array.isArray(p)) return fail("plan");
-  if (p.v !== 1) return fail("version");
+  if (p.v !== 2 || p.doc !== "nota_credito") return fail("version");
+  const c = p.credit;
+  if (!c || typeof c !== "object" || Array.isArray(c)) return fail("credit");
+  if (typeof c.document_id !== "string" || !UUID_RE.test(c.document_id)) return fail("credit.document_id");
+  if (!int(c.number, 1, 99_999_999)) return fail("credit.number");
+  if (typeof c.date !== "string" || !FISCAL_CREDIT_DATE_RE.test(c.date)) return fail("credit.date");
+  if (typeof c.registro !== "string" || !REGISTRO_RE.test(c.registro)) return fail("credit.registro");
+  if (c.job !== undefined && c.job !== null && (typeof c.job !== "string" || !UUID_RE.test(c.job))) return fail("credit.job");
+  if (c.reason !== undefined && c.reason !== null && !str(c.reason, 140)) return fail("credit.reason");
+  const cu = p.customer;
+  if (!cu || typeof cu !== "object" || !str(cu.tax_id, 20, 1) || !str(cu.name, 120, 1)) return fail("customer");
+  if (Array.isArray(p.comments) && p.comments.length > 0) return fail("comments");
+  return validateBody(p);
+}
+
+function validateBody(p) {
+  const fail = (error) => ({ ok: false, error });
   for (const k of ["r", "u", "job", "order_id", "series_id"]) {
     if (typeof p[k] !== "string" || !UUID_RE.test(p[k])) return fail(k);
   }
@@ -128,6 +186,7 @@ export function validatePlan(p) {
     if (!str(it.desc, 200, 1)) return fail("item.desc");
     if (!int(it.qty_milli, 1, 99_999_999)) return fail("item.qty");
     if (!int(it.gross_cents, 0, 1e15)) return fail("item.gross");
+    if (it.tax !== undefined && !FISCAL_ITEM_TAXES.has(it.tax)) return fail("item.tax");
     sum += it.gross_cents;
   }
   if (!int(p.total_cents, 1, 1e15) || sum !== p.total_cents) return fail("total");
@@ -146,12 +205,22 @@ export function validatePlan(p) {
 export const RECORDABLE_STATUSES = new Set(["printed", "voided", "needs_review"]);
 
 /**
- * Shape check of a result (the app, after verifying its signature).
+ * Shape check of a result (the app, after verifying its signature): v = 1
+ * for a factura, v = 2 + doc "nota_credito" + credit.document_id for a nota
+ * de crédito (0.9.6).
  * @returns {{ ok: true, result: object } | { ok: false, error: string }}
  */
 export function validateResult(r) {
   const fail = (error) => ({ ok: false, error });
-  if (!r || typeof r !== "object" || r.v !== 1) return fail("result");
+  if (!r || typeof r !== "object") return fail("result");
+  if (r.v === 2) {
+    if (r.doc !== "nota_credito") return fail("result");
+    if (!r.credit || typeof r.credit.document_id !== "string" || !UUID_RE.test(r.credit.document_id)) {
+      return fail("credit.document_id");
+    }
+  } else if (r.v !== 1 || (r.doc !== undefined && r.doc !== "factura")) {
+    return fail("result");
+  }
   for (const k of ["r", "u", "job", "order_id", "series_id"]) {
     if (typeof r[k] !== "string" || !UUID_RE.test(r[k])) return fail(k);
   }

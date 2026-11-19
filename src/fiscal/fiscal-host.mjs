@@ -13,6 +13,9 @@
 //     key AND by order — two tablets can't invoice one order twice
 //   * recovery of jobs cut short (boot, before the next job, every 2 min)
 //   * probe / connect / test DNF / Reporte X for the settings screen
+//   * 0.9.6: notas de crédito (creditNote) — the same job machinery, held
+//     per factura instead of per order; a printed NC releases the factura's
+//     job so the order can be invoiced again
 //
 // Plans are trusted here (index.mjs verified them). Results are signed with
 // the injected signer so the app can tell a real machine number from a
@@ -160,10 +163,16 @@ export function createFiscalHost(deps) {
 
   // ── results ─────────────────────────────────────────────────────────
 
+  const isCredit = (rec) => rec.doc === "nota_credito";
+
   function resultPayload(rec) {
     const o = rec.outcome;
     return {
-      v: 1,
+      // v 2 for an NC: an app that only knows facturas refuses it.
+      v: isCredit(rec) ? 2 : 1,
+      ...(isCredit(rec)
+        ? { doc: "nota_credito", credit: { document_id: rec.plan.credit.document_id, reason: rec.plan.credit.reason ?? null } }
+        : {}),
       t: rec.t,
       r: rec.r,
       u: rec.u,
@@ -180,6 +189,9 @@ export function createFiscalHost(deps) {
       error: o.error ?? null,
       customer: rec.plan?.customer ?? {},
       at: now(),
+      // 0.9.6: when the run started on the machine (epoch ms, this PC's
+      // clock) — the document's date, which `at` isn't after a recovery.
+      printed_at: rec.started_at ?? rec.created_at ?? null,
     };
   }
 
@@ -194,20 +206,45 @@ export function createFiscalHost(deps) {
         Number.isSafeInteger(outcome.docNumber) &&
         outcome.docNumber > 0;
       rec.result_token = recordable ? deps.signResult(rec.t, resultPayload(rec)) : null;
+      if (isCredit(rec) && recordable && outcome.status !== "voided") releaseCredited(rec);
     }
     journal.save(rec);
+    const noun = isCredit(rec) ? "nota de crédito" : "factura";
     log(
       `fiscal: ${rec.registro} orden ${rec.plan?.order_number ?? rec.order_id.slice(0, 8)} → ${outcome.status}` +
-        `${outcome.docNumber ? ` (factura ${outcome.docNumber})` : ""}${outcome.error ? ` [${outcome.error}]` : ""}`,
+        `${outcome.docNumber ? ` (${noun} ${outcome.docNumber})` : ""}${outcome.error ? ` [${outcome.error}]` : ""}`,
     );
     return rec;
+  }
+
+  /** The NC `ncRec` printed: the factura job it reverses stops holding the order. */
+  function releaseCredited(ncRec) {
+    const credit = ncRec.plan?.credit ?? {};
+    let target = credit.job ? journal.get(credit.job) : null;
+    if (target && (target.r !== ncRec.r || isCredit(target))) target = null;
+    if (!target) {
+      // A factura job without a recorded job key: the order's holder, if it
+      // printed exactly the affected number.
+      const holder = journal.holderFor(ncRec.r, ncRec.order_id);
+      if (
+        holder &&
+        !isCredit(holder) &&
+        holder.outcome?.docNumber === credit.number &&
+        holder.registro === String(credit.registro ?? "").toUpperCase()
+      ) {
+        target = holder;
+      }
+    }
+    if (target && journal.release(target, ncRec.job)) {
+      log(`fiscal: la factura ${target.outcome?.docNumber ?? "?"} quedó revertida por la nota de crédito ${ncRec.outcome?.docNumber}`);
+    }
   }
 
   /** What a device sees for a job. */
   function view(rec) {
     if (!rec) return { ok: false, error: "unknown_job" };
     const o = rec.outcome;
-    const base = { ok: true, job: rec.job, order_id: rec.order_id };
+    const base = { ok: true, job: rec.job, order_id: rec.order_id, doc: rec.doc ?? "factura" };
     if (rec.state === "accepted") return { ...base, status: "queued" };
     if (rec.state === "started" && (!o || o.status !== "interrupted")) return { ...base, status: "in_progress" };
     return {
@@ -238,7 +275,9 @@ export function createFiscalHost(deps) {
       const started = rec.started ?? {};
       const out = await recoverInvoice(session, {
         step: rec.step ?? "body",
+        doc: rec.doc ?? "factura",
         lastFactura: started.lastFactura,
+        lastNumber: started.lastNumber ?? started.lastFactura,
         zCounter: started.zCounter ?? 0,
         flag50: started.flag50 ?? 0,
         finalCode: rec.plan.payments[rec.plan.payments.length - 1].code,
@@ -267,21 +306,25 @@ export function createFiscalHost(deps) {
   // ── the factura ─────────────────────────────────────────────────────
 
   /**
+   * A factura (doc "factura", /lan/v1/fiscal/invoice) or a nota de crédito
+   * (0.9.6, doc "nota_credito", /lan/v1/fiscal/credit-note).
    * @param {{ t: string, r: string, u: string }} claims  the LAN token's
-   * @param {import("../fiscal-plan.mjs").FiscalPlan} plan  verified + validated
+   * @param {object} plan  verified + validated (validatePlan / validateCreditPlan)
+   * @param {"factura" | "nota_credito"} doc
    * @returns {Promise<{ status: number, body: object }>}
    */
-  async function invoice(claims, plan) {
+  async function submit(claims, plan, doc) {
     const same = journal.get(plan.job);
     if (same) {
-      if (same.r !== claims.r) return { status: 404, body: { ok: false, error: "unknown_job" } };
+      if (same.r !== claims.r || (same.doc ?? "factura") !== doc) return { status: 404, body: { ok: false, error: "unknown_job" } };
       return { status: 200, body: await waitView(same) };
     }
     const m = findMachine(claims.r, plan.registro);
     if (!m) return { status: 404, body: { ok: false, error: "unknown_machine" } };
     // Check and claim in the same tick: no await between them, so two
-    // devices racing on one order can't both get through.
-    const holder = journal.holderFor(claims.r, plan.order_id);
+    // devices racing on one order (or one factura's NC) can't both get through.
+    const hold = doc === "nota_credito" ? `nc:${plan.credit.document_id}` : plan.order_id;
+    const holder = journal.holderFor(claims.r, hold);
     if (holder) {
       const v = view(holder);
       const inFlight = holder.state !== "done";
@@ -296,6 +339,7 @@ export function createFiscalHost(deps) {
       series_id: plan.series_id,
       registro: m.registro,
       src: plan.src,
+      ...(doc === "nota_credito" ? { doc, hold } : {}),
       plan,
       state: "accepted",
       step: null,
@@ -309,6 +353,7 @@ export function createFiscalHost(deps) {
     const run = withMachine(m, async (session) => {
       if (pendingFor(m)) await recoverOn(session, m);
       rec.state = "started";
+      rec.started_at = now();
       journal.save(rec);
       const outcome = await runInvoice(session, plan, {
         log,
@@ -317,6 +362,7 @@ export function createFiscalHost(deps) {
           if (step === "body") {
             rec.started = {
               lastFactura: data.lastFactura,
+              lastNumber: data.lastNumber ?? data.lastFactura,
               zCounter: data.zCounter,
               flag21: data.flag21,
               flag50: data.flag50,
@@ -515,7 +561,8 @@ export function createFiscalHost(deps) {
     ports,
     connect,
     disconnect,
-    invoice,
+    invoice: (claims, plan) => submit(claims, plan, "factura"),
+    creditNote: (claims, plan) => submit(claims, plan, "nota_credito"),
     job: (restaurantId, jobKey) => {
       const rec = journal.get(jobKey);
       return rec && rec.r === restaurantId ? view(rec) : { ok: false, error: "unknown_job" };

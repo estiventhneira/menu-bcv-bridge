@@ -10,8 +10,12 @@
 //   ENQ (a raw byte, not a frame)
 //   S1 S2 S2E S21 S22 S23 S3 SV        reads
 //   iR* iS* i00..i09                   customer and info lines
-//   @                                  comment
+//   @                                  comment (factura only)
 //   <tax><price><qty><description>     item, widths per flag 21
+//   iF* iD* iI*                        0.9.6 nota de crédito header: the
+//                                      affected factura's number, date and
+//                                      the machine registro that printed it
+//   d<rate><price><qty><description>   0.9.6 nota de crédito item (spec §6)
 //   3                                  subtotal
 //   2MM<amount>  1MM                   payments, MM = 01..19 only (D2: never
 //                                      the divisa codes 20-24, so never IGTF)
@@ -19,6 +23,8 @@
 //   7                                  cancel the open document
 //   80<attr><text>  81<attr><text>     documento no fiscal
 //   I0X                                Reporte X
+// The NC comment command (A<text>) is left out on purpose: nothing needs it,
+// and a one-letter prefix is too wide for an allowlist.
 
 import { sanitizeText } from "./hka-frame.mjs";
 
@@ -42,6 +48,11 @@ const ALLOWED = [
   // Item: tax char, then price+qty digits (10+8 for flag 21 = 00/01/02/11/12,
   // 16+17 for 30), then a description.
   new RegExp(`^[ !"#$](?:[0-9]{18}|[0-9]{33})${TEXT}{1,120}$`),
+  // 0.9.6 nota de crédito: header (spec §6) and items d0..d4, same widths.
+  /^iF\*[0-9]{1,11}$/,
+  /^iD\*(?:0[1-9]|[12][0-9]|3[01])\/(?:0[1-9]|1[0-2])\/20[0-9]{2}$/,
+  /^iI\*[A-Z0-9]{3,16}$/,
+  new RegExp(`^d[0-4](?:[0-9]{18}|[0-9]{33})${TEXT}{1,120}$`),
   /^3$/,
   /^2(?:0[1-9]|1[0-9])(?:[0-9]{12}|[0-9]{17})$/,
   /^1(?:0[1-9]|1[0-9])$/,
@@ -108,6 +119,8 @@ export function centsToScale(cents, dec) {
 // ── builders ────────────────────────────────────────────────────────────
 
 const TAX_CHARS = { E: " ", G: "!", R: '"', A: "#", P: "$" };
+/** Nota de crédito items carry the rate as a digit after "d" (spec §6). */
+const CREDIT_TAX_PREFIX = { E: "d0", G: "d1", R: "d2", A: "d3", P: "d4" };
 
 /** Item description width: the printer wraps up to 120 chars; one line keeps
  *  facturas short (chars per line is hardware checklist item 11). */
@@ -118,18 +131,40 @@ export const ITEM_DESC_MAX = 40;
  *   qtyMilli: number, description: string }} item  priceScaled in the
  *   price field's own scale (centsToScale)
  * @param {Widths} w
+ * @param {"factura" | "nota_credito"} [doc]  0.9.6: an NC line is d<rate>…
  */
-export function itemCommand(item, w) {
-  const taxChar = TAX_CHARS[item.tax];
-  if (taxChar === undefined) throw new Error(`hka: tasa ${item.tax} desconocida`);
+export function itemCommand(item, w, doc = "factura") {
+  const prefix = doc === "nota_credito" ? CREDIT_TAX_PREFIX[item.tax] : TAX_CHARS[item.tax];
+  if (prefix === undefined) throw new Error(`hka: tasa ${item.tax} desconocida`);
   if (!Number.isSafeInteger(item.qtyMilli) || item.qtyMilli <= 0) throw new Error("hka: cantidad inválida");
   const desc = sanitizeText(item.description, ITEM_DESC_MAX) || "Producto";
   const cmd =
-    taxChar +
+    prefix +
     fixedField(item.priceScaled, w.priceInt, w.priceDec) +
     fixedField(item.qtyMilli, w.qtyInt, w.qtyDec) +
     desc;
   return assertAllowed(cmd);
+}
+
+/** Width the NC header gives the affected factura number (S1 prints 8;
+ *  TFHKA's BIN driver pads to 8 — hardware checklist). */
+export const CREDIT_FACTURA_DIGITS = 8;
+
+/**
+ * Nota de crédito header (0.9.6, spec §6): affected factura number, its
+ * date and the registro of the machine that printed it. All three are
+ * required (with iR* / iS*) or the machine won't open the NC.
+ * @param {{ number: number, date: string, registro: string }} target
+ */
+export function creditHeaderCommands(target) {
+  if (!Number.isSafeInteger(target?.number) || target.number < 1 || target.number > 99_999_999) {
+    throw new Error("hka: número de factura afectada inválido");
+  }
+  return [
+    assertAllowed(`iF*${String(target.number).padStart(CREDIT_FACTURA_DIGITS, "0")}`),
+    assertAllowed(`iD*${target.date}`),
+    assertAllowed(`iI*${String(target.registro ?? "").trim().toUpperCase()}`),
+  ];
 }
 
 /** Customer header lines: RIF/CI, razón social, then up to 5 extra lines

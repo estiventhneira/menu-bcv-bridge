@@ -33,6 +33,7 @@
 // fiscal_admin / fiscal_report scope.
 //   POST /lan/v1/fiscal/status      machines, unrecorded results ({ live })
 //   POST /lan/v1/fiscal/invoice     { plan } — print a factura
+//   POST /lan/v1/fiscal/credit-note { plan } — print a nota de crédito (0.9.6)
 //   POST /lan/v1/fiscal/job         { job } — poll a factura job
 //   POST /lan/v1/fiscal/ack         { receipt } — results recorded
 //   POST /lan/v1/fiscal/ports       serial ports on this PC
@@ -368,6 +369,8 @@ const ROUTES_080 = {
   // 0.9.0
   "/lan/v1/fiscal/status": { dep: "fiscalStatus", validate: validateFiscalStatus, field: "req" },
   "/lan/v1/fiscal/invoice": { dep: "fiscalInvoice", validate: validateFiscalInvoice, field: "req" },
+  // 0.9.6 — same { plan } body; the handler only accepts a credit plan.
+  "/lan/v1/fiscal/credit-note": { dep: "fiscalCreditNote", validate: validateFiscalInvoice, field: "req" },
   "/lan/v1/fiscal/job": { dep: "fiscalJob", validate: validateFiscalJob, field: "req" },
   "/lan/v1/fiscal/ack": { dep: "fiscalAck", validate: validateFiscalAck, field: "req" },
   "/lan/v1/fiscal/ports": { dep: "fiscalPorts", validate: validateFiscalPorts, field: "req" },
@@ -395,6 +398,7 @@ const ROUTES_080 = {
  *   ticketReprint?: (claims: object, reprint: object) => Promise<Reply> | Reply,
  *   fiscalStatus?: (claims: object, req: object) => Promise<Reply> | Reply,
  *   fiscalInvoice?: (claims: object, req: object) => Promise<Reply> | Reply,
+ *   fiscalCreditNote?: (claims: object, req: object) => Promise<Reply> | Reply,
  *   fiscalJob?: (claims: object, req: object) => Promise<Reply> | Reply,
  *   fiscalAck?: (claims: object, req: object) => Promise<Reply> | Reply,
  *   fiscalPorts?: (claims: object, req: object) => Promise<Reply> | Reply,

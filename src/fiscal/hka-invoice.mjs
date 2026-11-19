@@ -16,6 +16,13 @@
 // The journal step tells recovery what an N+1 means after a crash: an
 // issued factura (paying) or a voided one (body / cancelling — a factura
 // can't close without being paid).
+//
+// 0.9.6: the same run prints a nota de crédito (plan.doc = "nota_credito",
+// spec §6): the header iF*/iD*/iI* + iR*/iS* goes first, items are d1…
+// lines, no comment line, and N is S1's NC counter (field 6), which moves
+// on its own — a factura and an NC never share a number. Before paying, S2
+// must not say "factura": an NC the machine opened as a factura is
+// cancelled, never paid.
 
 import {
   CANCEL,
@@ -23,6 +30,7 @@ import {
   REPORT_X,
   SUBTOTAL,
   commentCommand,
+  creditHeaderCommands,
   customerCommands,
   footerCommands,
   fullPaymentCommand,
@@ -33,6 +41,24 @@ import {
 } from "./hka-commands.mjs";
 import { isTaxIncluded, normalizeRif, parseS1, parseS2, parseS3, parseSV } from "./hka-parse.mjs";
 
+/** @typedef {"factura" | "nota_credito"} FiscalDoc */
+
+/** @returns {FiscalDoc} */
+export function docOf(plan) {
+  return plan?.doc === "nota_credito" ? "nota_credito" : "factura";
+}
+
+/** The machine counter a document of `doc` advances (S1 field 2 / 6). */
+export function numberOf(s1, doc) {
+  return doc === "nota_credito" ? s1.lastNotaCredito : s1.lastFactura;
+}
+
+/** A factura message, worded for the document at hand. */
+function forDoc(text, doc) {
+  if (doc !== "nota_credito" || typeof text !== "string") return text;
+  return text.replaceAll("facturas", "notas de crédito").replaceAll("factura", "nota de crédito");
+}
+
 /** SV model code of the ACLAS PP9-PLUS. */
 export const PP9_PLUS_MODEL = "ZZP";
 
@@ -41,7 +67,8 @@ export function totalTolerance(totalCents) {
   return Math.max(100, Math.round(totalCents / 1000));
 }
 
-// ── money (D1: every line at tasa 1, prices IVA-inclusive) ──────────────
+// ── money (D1: every line at tasa 1, prices IVA-inclusive; 392: the ─────
+// propina, when the restaurant bills it, as an exento line) ──────────────
 
 /** round(a / b), half up, bigints ≥ 0. */
 function divRound(a, b) {
@@ -92,29 +119,42 @@ export function spread(total, weights) {
 
 /**
  * Item lines as the machine must receive them, and the total it will
- * compute from them.
- * @param {Array<{ desc: string, qty_milli: number, gross_cents: number }>} items
+ * compute from them. 0.9.6 (392): an exento line (tax "E", the propina)
+ * goes at its own price, outside the tasa-general base.
+ * @param {Array<{ desc: string, qty_milli: number, gross_cents: number, tax?: "G" | "E" }>} items
  * @param {number} totalCents  Σ gross_cents
  * @param {{ type: number, bp: number }} rate  tasa 1 from S3
  * @param {import("./hka-commands.mjs").Widths} w
  */
 export function machineLines(items, totalCents, rate, w) {
   const included = isTaxIncluded(rate.type);
-  const targets = included
-    ? items.map((it) => it.gross_cents)
-    : spread(netBaseFor(totalCents, rate.bp).base, items.map((it) => it.gross_cents));
+  const exempt = items.map((it) => it.tax === "E");
+  const exemptGross = items.reduce((s, it, i) => (exempt[i] ? s + it.gross_cents : s), 0);
+  const net = included
+    ? null
+    : spread(
+        netBaseFor(totalCents - exemptGross, rate.bp).base,
+        items.map((it, i) => (exempt[i] ? 0 : it.gross_cents)),
+      );
   const unit = 10n ** BigInt(w.priceDec);
-  let sum = 0;
+  let taxed = 0;
+  let exemptCents = 0;
   const lines = items.map((it, i) => {
+    const target = exempt[i] || !net ? it.gross_cents : net[i];
     const qty = BigInt(it.qty_milli);
     // price (field scale) = target / qty, rounded; the machine's line amount
     // is price × qty rounded to cents.
-    const priceScaled = divRound(BigInt(targets[i]) * unit * 1000n, 100n * qty);
+    const priceScaled = divRound(BigInt(target) * unit * 1000n, 100n * qty);
     const amountCents = Number(divRound(priceScaled * qty * 100n, unit * 1000n));
-    sum += amountCents;
-    return { priceScaled, qtyMilli: it.qty_milli, description: it.desc, amountCents };
+    if (exempt[i]) exemptCents += amountCents;
+    else taxed += amountCents;
+    return { tax: exempt[i] ? "E" : "G", priceScaled, qtyMilli: it.qty_milli, description: it.desc, amountCents };
   });
-  return { lines, expectedTotal: included ? sum : sum + taxOnBase(sum, rate.bp) };
+  return {
+    lines,
+    expectedTotal: (included ? taxed : taxed + taxOnBase(taxed, rate.bp)) + exemptCents,
+    exemptCents,
+  };
 }
 
 // ── outcomes ────────────────────────────────────────────────────────────
@@ -149,6 +189,8 @@ const MESSAGES = {
   wrong_rif: "El RIF de la máquina no es el del restaurante.",
   journal: "El bridge no pudo guardar el registro de la factura: se anuló en la máquina.",
   recovered: "La factura quedó a medias (el bridge o la máquina se reiniciaron) y se resolvió en la máquina.",
+  // No "factura" in it on purpose: forDoc rewords every NC message.
+  wrong_document: "La máquina abrió otro tipo de documento en lugar de la nota de crédito: se anuló sin cobrar.",
 };
 
 /**
@@ -183,12 +225,21 @@ async function readS1(session) {
  * @param {ReturnType<typeof import("./hka-session.mjs").createHkaSession>} session
  * @param {{ registro: string, rif: string, customer?: object, comments?: string[],
  *   items: Array<{ desc: string, qty_milli: number, gross_cents: number }>,
- *   footer?: string[], payments: Array<{ code: string, cents: number }>, total_cents: number }} plan
+ *   footer?: string[], payments: Array<{ code: string, cents: number }>, total_cents: number,
+ *   doc?: "factura" | "nota_credito", credit?: { number: number, date: string, registro: string } }} plan
  * @param {{ onStep?: (step: "body" | "paying" | "cancelling", data: object) => Promise<void> | void,
  *   log?: (...a: unknown[]) => void }} [hooks]
  * @returns {Promise<InvoiceOutcome>}
  */
 export async function runInvoice(session, plan, hooks = {}) {
+  const doc = docOf(plan);
+  const out = await runDocument(session, plan, doc, hooks);
+  return doc === "factura" || typeof out.message !== "string" || out.verbatim
+    ? out
+    : { ...out, message: forDoc(out.message, doc) };
+}
+
+async function runDocument(session, plan, doc, hooks) {
   const onStep = hooks.onStep ?? (() => {});
 
   // 1. Preflight — nothing reaches a document until all of it passes.
@@ -230,11 +281,16 @@ export async function runInvoice(session, plan, hooks = {}) {
   let lines;
   try {
     lines = machineLines(plan.items, plan.total_cents, rate, widths);
+    const customer = customerCommands(plan.customer);
+    if (doc === "nota_credito" && !(customer.some((c) => c.startsWith("iR*")) && customer.some((c) => c.startsWith("iS*")))) {
+      throw new Error("la nota de crédito necesita RIF y nombre del cliente");
+    }
     commands = [
-      ...customerCommands(plan.customer),
-      ...(plan.comments ?? []).map(commentCommand).filter(Boolean),
+      ...(doc === "nota_credito" ? creditHeaderCommands(plan.credit) : []),
+      ...customer,
+      ...(doc === "factura" ? (plan.comments ?? []).map(commentCommand).filter(Boolean) : []),
       ...lines.lines.map((l) =>
-        itemCommand({ tax: "G", priceScaled: l.priceScaled, qtyMilli: l.qtyMilli, description: l.description }, widths),
+        itemCommand({ tax: l.tax, priceScaled: l.priceScaled, qtyMilli: l.qtyMilli, description: l.description }, widths, doc),
       ),
       ...footerCommands(plan.footer),
     ];
@@ -243,9 +299,12 @@ export async function runInvoice(session, plan, hooks = {}) {
     return blocked("invalid_plan", `No se pudo preparar la factura: ${e.message}`);
   }
 
-  const N = s1.lastFactura;
+  const N = numberOf(s1, doc);
   const ctx = {
+    doc,
     N,
+    // An NC's run also watches the factura counter (wrong_document).
+    lastFactura: s1.lastFactura,
     zNumber: s1.zCounter + 1,
     flag50,
     finalCode: pays[pays.length - 1].code,
@@ -253,7 +312,15 @@ export async function runInvoice(session, plan, hooks = {}) {
     onStep,
   };
   try {
-    await onStep("body", { lastFactura: N, zCounter: s1.zCounter, flag21: widths.flag21, flag50: flag50 ? 1 : 0, rate });
+    await onStep("body", {
+      doc,
+      lastNumber: N,
+      lastFactura: s1.lastFactura,
+      zCounter: s1.zCounter,
+      flag21: widths.flag21,
+      flag50: flag50 ? 1 : 0,
+      rate,
+    });
   } catch {
     return blocked("journal", "El bridge no pudo guardar el registro de la factura. Revisa el disco de la PC.");
   }
@@ -271,6 +338,10 @@ export async function runInvoice(session, plan, hooks = {}) {
     s2 = parseS2(await session.read("S2"));
   } catch {
     return abortBeforePayment(session, ctx, "timeout");
+  }
+  if (doc === "nota_credito" && s2.docType === "factura") {
+    hooks.log?.("fiscal: la máquina abrió una factura en lugar de la nota de crédito — se anula sin cobrar");
+    return abortBeforePayment(session, ctx, "wrong_document");
   }
   if (Math.abs(s2.dueCents - plan.total_cents) > totalTolerance(plan.total_cents)) {
     // Kept in the outcome (the job file on the PC) and the message: the
@@ -292,11 +363,14 @@ export async function runInvoice(session, plan, hooks = {}) {
     const figures = ` (máquina Bs ${bs(s2.dueCents)}, cobro Bs ${bs(plan.total_cents)})`;
     return { ...out, mismatch, ...(out.error === "total_mismatch" ? { message: `${out.message}${figures}` } : {}) };
   }
+  // An exento line's amount is its price × qty, exactly what the machine
+  // bills, so the tasa-general base is what remains of the total after IVA:
+  // right whether or not S2's base field counts the exento part.
   ctx.totals = {
     total_cents: s2.dueCents,
-    base_cents: s2.baseCents,
+    base_cents: lines.exemptCents > 0 ? Math.max(0, s2.dueCents - s2.taxCents - lines.exemptCents) : s2.baseCents,
     tax_cents: s2.taxCents,
-    exempt_cents: 0,
+    exempt_cents: lines.exemptCents,
     rate_bp: rate.bp,
   };
 
@@ -345,19 +419,20 @@ export async function runInvoice(session, plan, hooks = {}) {
 
 /** After the document closed with payments: what S1 says happened. */
 function confirmIssued(after, ctx, reviewReason) {
-  if (after.lastFactura === ctx.N + 1) {
+  const n = numberOf(after, ctx.doc);
+  if (n === ctx.N + 1) {
     return reviewReason
       ? { status: "needs_review", docNumber: ctx.N + 1, zNumber: ctx.zNumber, totals: ctx.totals, reviewReason }
       : { status: "printed", docNumber: ctx.N + 1, zNumber: ctx.zNumber, totals: ctx.totals };
   }
-  if (after.lastFactura > ctx.N + 1) {
+  if (n > ctx.N + 1) {
     return {
       status: "needs_review",
-      docNumber: after.lastFactura,
+      docNumber: n,
       zNumber: ctx.zNumber,
       totals: ctx.totals,
       reviewReason: "number_jumped",
-      message: `La máquina avanzó de ${ctx.N} a ${after.lastFactura}: otro programa imprimió facturas.`,
+      message: `La máquina avanzó de ${ctx.N} a ${n}: otro programa imprimió facturas.`,
     };
   }
   return {
@@ -385,8 +460,23 @@ async function abortBeforePayment(session, ctx, reason) {
       await session.waitIdle({ maxMs: 30_000, stopOnOpenDocument: false });
     }
     const after = await readS1(session);
-    if (after.lastFactura === ctx.N) return { status: "not_printed", error: reason, message };
-    if (after.lastFactura === ctx.N + 1) {
+    if (reason === "wrong_document" && Number.isSafeInteger(ctx.lastFactura) && after.lastFactura > ctx.lastFactura) {
+      // The machine had opened a FACTURA: 7 burned a factura number, not an
+      // NC's. needs_review without a number holds this NC (no retry burns
+      // another one) until a person looks at the machine.
+      return {
+        status: "needs_review",
+        docNumber: null,
+        error: reason,
+        reviewReason: "wrong_document",
+        burnedFactura: after.lastFactura,
+        message: `La máquina abrió una factura en lugar de la nota de crédito y quedó anulada (factura Nº ${after.lastFactura}). Revisa la máquina antes de reintentar.`,
+        verbatim: true,
+      };
+    }
+    const n = numberOf(after, ctx.doc);
+    if (n === ctx.N) return { status: "not_printed", error: reason, message };
+    if (n === ctx.N + 1) {
       return { status: "voided", docNumber: ctx.N + 1, zNumber: ctx.zNumber, error: reason, message };
     }
     return {
@@ -394,7 +484,7 @@ async function abortBeforePayment(session, ctx, reason) {
       docNumber: null,
       error: reason,
       reviewReason: "number_jumped",
-      message: `La máquina avanzó de ${ctx.N} a ${after.lastFactura} sin factura de este cobro.`,
+      message: `La máquina avanzó de ${ctx.N} a ${n} sin factura de este cobro.`,
     };
   } catch (e) {
     return { status: "interrupted", error: "no_response", message: `${MESSAGES.timeout} (${e.message})` };
@@ -426,14 +516,24 @@ async function finishAfterPayment(session, ctx, reason) {
  * Resolve a job whose run never finished (bridge restart, link lost).
  * @param {object} session
  * @param {{ step: "body" | "paying" | "cancelling", lastFactura: number, zCounter: number,
- *   flag50: number, finalCode: string, totals: object | null }} rec
+ *   flag50: number, finalCode: string, totals: object | null,
+ *   doc?: "factura" | "nota_credito", lastNumber?: number }} rec
+ *   0.9.6: doc + lastNumber (the counter of that document); a journal from
+ *   0.9.5 has only lastFactura, which is a factura's lastNumber.
  * @returns {Promise<InvoiceOutcome | null>} null while the machine doesn't answer
  */
 export async function recoverInvoice(session, rec) {
+  const doc = rec.doc === "nota_credito" ? "nota_credito" : "factura";
+  const out = await recoverDocument(session, rec, doc);
+  return !out || doc === "factura" || typeof out.message !== "string" ? out : { ...out, message: forDoc(out.message, doc) };
+}
+
+async function recoverDocument(session, rec, doc) {
   const st = await session.waitIdle({ maxMs: 15_000 });
   if (!st) return null;
   const ctx = {
-    N: rec.lastFactura,
+    doc,
+    N: Number.isSafeInteger(rec.lastNumber) ? rec.lastNumber : rec.lastFactura,
     zNumber: rec.zCounter + 1,
     flag50: rec.flag50 === 1,
     finalCode: rec.finalCode,
@@ -445,10 +545,10 @@ export async function recoverInvoice(session, rec) {
     return abortBeforePayment(session, ctx, "recovered");
   }
   try {
-    const after = await readS1(session);
-    if (after.lastFactura === ctx.N) return { status: "not_printed", error: "recovered", message: "La factura no llegó a imprimirse." };
-    if (after.lastFactura === ctx.N + 1) {
-      // Closed while we were away. Only a paid factura closes on its own;
+    const n = numberOf(await readS1(session), doc);
+    if (n === ctx.N) return { status: "not_printed", error: "recovered", message: "La factura no llegó a imprimirse." };
+    if (n === ctx.N + 1) {
+      // Closed while we were away. Only a paid document closes on its own;
       // before the payment step the only way out was 7.
       return rec.step === "paying"
         ? { status: "needs_review", docNumber: ctx.N + 1, zNumber: ctx.zNumber, totals: ctx.totals, reviewReason: "recovered" }
@@ -459,7 +559,7 @@ export async function recoverInvoice(session, rec) {
       docNumber: null,
       totals: ctx.totals,
       reviewReason: "number_jumped",
-      message: `La máquina avanzó de ${ctx.N} a ${after.lastFactura} mientras el bridge estaba fuera.`,
+      message: `La máquina avanzó de ${ctx.N} a ${n} mientras el bridge estaba fuera.`,
     };
   } catch {
     return null;

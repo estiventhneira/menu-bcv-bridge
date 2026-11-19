@@ -13,6 +13,11 @@
 // answering) is resolved by recoverInvoice against the machine. Recorded
 // jobs are kept 30 days, others 7 — the machine itself is the long-term
 // record (audit memory, Z reports).
+//
+// 0.9.6: a job holds a KEY, not always an order. A factura holds its order
+// (rec.order_id); a nota de crédito holds `nc:<factura document id>`
+// (rec.hold), so each factura gets at most one NC. A printed NC releases the
+// factura's job (released_at), so the order can be invoiced again.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -65,9 +70,10 @@ export function createFiscalJournal({ dir, now = () => Date.now(), log = () => {
     return rec;
   }
 
-  /** Does this job keep its order from being invoiced again? */
+  /** Does this job keep its key (order / factura) from being printed again? */
   function holds(rec) {
     if (rec.state !== "done") return true;
+    if (rec.released_at) return false;
     return HOLDING.has(rec.outcome?.status);
   }
 
@@ -75,14 +81,29 @@ export function createFiscalJournal({ dir, now = () => Date.now(), log = () => {
     get: (job) => jobs.get(job) ?? null,
     save,
 
-    /** The job that holds `orderId` (in flight, or a factura on the machine). */
-    holderFor(restaurantId, orderId) {
+    /**
+     * The job that holds `key` (in flight, or a document on the machine):
+     * an order id for a factura, `nc:<factura id>` for a nota de crédito.
+     */
+    holderFor(restaurantId, key) {
       let best = null;
       for (const rec of jobs.values()) {
-        if (rec.r !== restaurantId || rec.order_id !== orderId || !holds(rec)) continue;
+        if (rec.r !== restaurantId || (rec.hold ?? rec.order_id) !== key || !holds(rec)) continue;
         if (!best || rec.created_at > best.created_at) best = rec;
       }
       return best;
+    },
+
+    /**
+     * A nota de crédito reversed the factura `rec` printed: it no longer
+     * holds its order. Returns whether anything changed.
+     */
+    release(rec, byJob) {
+      if (!rec || rec.released_at) return false;
+      rec.released_at = now();
+      rec.released_by = byJob;
+      save(rec);
+      return true;
     },
 
     /** Jobs whose run never finished (recovery). */

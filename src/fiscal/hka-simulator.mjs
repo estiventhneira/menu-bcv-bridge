@@ -14,6 +14,15 @@
 // swallowed (busy), executed-but-unanswered, paper out, and a crash after N
 // commands (the cable pulled; reconnect() keeps the open document, as the
 // real machine's battery does).
+//
+// 0.9.6: notas de crédito (spec §6). iF*/iD*/iI* open one; its items are
+// d0..d4 lines, accepted only once the header AND iR*/iS* arrived (the real
+// machine won't open an NC without them); S2 field 7 reads 2; it closes on
+// S1's NC counter (field 6), and 7 prints NOTA DE CRÉDITO ANULADA.
+// ncReportsAsFactura makes S2 claim an open NC is a factura;
+// ncOpensAsFactura makes the machine really open a FACTURA on the NC header
+// (its d-lines go in as factura items, 7 burns a factura number) — both to
+// prove the bridge cancels instead of paying.
 
 import { ACK, NAK, buildFrame, decodeLatin1, replyBytes } from "./hka-frame.mjs";
 import { createFrameReader } from "./hka-reader.mjs";
@@ -22,6 +31,9 @@ import { isTaxIncluded } from "./hka-parse.mjs";
 
 const PRINTING = /^(?:3|2\d{2}\d+|1\d{2}|7|81.*|I0X)$/;
 const RATE_INDEX = { " ": 0, "!": 1, '"': 2, "#": 3, "$": 4 };
+
+/** A fiscal document (factura or nota de crédito) is open. */
+const isFiscal = (doc) => doc?.kind === "factura" || doc?.kind === "nota_credito";
 
 function pad(n, width) {
   return String(Math.max(0, Math.trunc(n))).padStart(width, "0").slice(-width);
@@ -36,9 +48,9 @@ function divRound(a, b) {
  * @param {{ registro?: string, rif?: string, mode?: "fiscal" | "training",
  *   flag21?: number, flag50?: number, flag63?: number,
  *   rates?: Array<{ type: number, bp: number }>,
- *   lastFactura?: number, lastNoFiscal?: number, zCounter?: number,
+ *   lastFactura?: number, lastNotaCredito?: number, lastNoFiscal?: number, zCounter?: number,
  *   printDelayMs?: number, latencyMs?: number,
- *   taxSemantics?: "excluded" | "included" }} [opts]
+ *   taxSemantics?: "excluded" | "included", ncReportsAsFactura?: boolean, ncOpensAsFactura?: boolean }} [opts]
  *   taxSemantics overrides what the S3 tax type means — models the spec's
  *   open question (§3.3: is type 1 "excluded" or "included"?)
  */
@@ -63,7 +75,7 @@ export function createHkaSimulator(opts = {}) {
     counters: {
       factura: opts.lastFactura ?? 100,
       facturasToday: 0,
-      nc: 0,
+      nc: opts.lastNotaCredito ?? 0,
       nd: 0,
       dnf: opts.lastNoFiscal ?? 50,
       z: opts.zCounter ?? 10,
@@ -72,9 +84,10 @@ export function createHkaSimulator(opts = {}) {
     },
     sts2: 0x40,
     paperOut: false,
-    /** @type {null | { kind: "factura" | "dnf", items: number, amounts: number[],
+    /** @type {null | { kind: "factura" | "nota_credito" | "dnf", items: number, amounts: number[],
      *   paid: number, payments: Array<{ code: string, cents: number }>,
-     *   subtotal: boolean, lines: string[], customer: string[] }} */
+     *   subtotal: boolean, lines: string[], customer: string[],
+     *   credit?: { F?: string, D?: string, I?: string }, rif?: boolean, name?: boolean }} */
     doc: null,
     busyUntil: 0,
   };
@@ -111,7 +124,7 @@ export function createHkaSimulator(opts = {}) {
 
   function sts1() {
     let s = state.mode === "fiscal" ? 0x60 : 0x40;
-    if (state.doc?.kind === "factura") s |= 0x01;
+    if (isFiscal(state.doc)) s |= 0x01;
     if (state.doc?.kind === "dnf") s |= 0x02;
     return s;
   }
@@ -143,19 +156,26 @@ export function createHkaSimulator(opts = {}) {
 
   function closeFactura() {
     const tot = totals();
-    state.counters.factura++;
-    state.counters.facturasToday++;
-    state.counters.dailyTotal += tot.total;
+    const nc = state.doc.kind === "nota_credito";
+    if (nc) {
+      state.counters.nc++;
+    } else {
+      state.counters.factura++;
+      state.counters.facturasToday++;
+      state.counters.dailyTotal += tot.total;
+    }
     paper.push({
-      kind: "factura",
-      number: state.counters.factura,
+      kind: nc ? "nota_credito" : "factura",
+      number: nc ? state.counters.nc : state.counters.factura,
       z: state.counters.z + 1,
       total: tot.total,
       base: tot.base,
       tax: tot.tax,
+      exempt: state.doc.amounts[0],
       payments: state.doc.payments.slice(),
       lines: state.doc.lines.slice(),
       customer: state.doc.customer.slice(),
+      ...(nc ? { credit: { ...state.doc.credit } } : {}),
     });
     state.doc = null;
   }
@@ -164,9 +184,19 @@ export function createHkaSimulator(opts = {}) {
     state.doc = { kind: "factura", items: 0, amounts: [0, 0, 0, 0, 0], paid: 0, payments: [], subtotal: false, lines: [], customer: [] };
   }
 
+  function openCreditNote() {
+    state.doc = {
+      kind: "nota_credito", items: 0, amounts: [0, 0, 0, 0, 0], paid: 0, payments: [], subtotal: false,
+      lines: [], customer: [], credit: {}, rif: false, name: false,
+    };
+  }
+
+  /** The NC header the real machine needs before its first item. */
+  const creditHeaderComplete = (doc) => !!(doc.credit?.F && doc.credit?.D && doc.credit?.I && doc.rif && doc.name);
+
   function s2Text(prefix, part) {
     const w = state.flags[63] % 2 === 1 ? 17 : 13;
-    if (!state.doc || state.doc.kind !== "factura") {
+    if (!isFiscal(state.doc)) {
       return `${prefix}\n${[pad(0, w), pad(0, w), pad(0, w), pad(0, 6), pad(0, w), pad(0, 4), "0"].join("\n")}`;
     }
     const tot = totals();
@@ -179,7 +209,7 @@ export function createHkaSimulator(opts = {}) {
       pad(state.doc.items * 1000, 6),
       pad(due, w),
       pad(state.doc.payments.length, 4),
-      "1",
+      state.doc.kind === "nota_credito" && !opts.ncReportsAsFactura ? "2" : "1",
     ].join("\n")}`;
   }
 
@@ -237,10 +267,24 @@ export function createHkaSimulator(opts = {}) {
       return { reply: "none" };
     }
     if (state.paperOut && PRINTING.test(cmd)) return nak(0x41);
+    if (/^i[FDI]\*/.test(cmd)) {
+      if (opts.ncOpensAsFactura) {
+        if (doc && (doc.kind !== "factura" || doc.items > 0)) return nak();
+        if (!doc) openFactura();
+        return ack();
+      }
+      // NC header: opens a nota de crédito; never inside a factura or after items.
+      if (doc && (doc.kind !== "nota_credito" || doc.items > 0)) return nak();
+      if (!doc) openCreditNote();
+      state.doc.credit[cmd[1]] = cmd.slice(3);
+      return ack();
+    }
     if (/^iR\*|^iS\*/.test(cmd)) {
       if (doc?.kind === "dnf" || (doc && doc.items > 0)) return nak();
       if (!doc) openFactura();
       state.doc.customer.push(cmd.slice(3));
+      if (cmd[1] === "R") state.doc.rif = true;
+      else state.doc.name = true;
       return ack();
     }
     if (/^i0\d/.test(cmd)) {
@@ -250,21 +294,28 @@ export function createHkaSimulator(opts = {}) {
       return ack();
     }
     if (cmd.startsWith("@")) {
-      if (doc?.kind === "dnf" || doc?.payments.length) return nak();
+      // An NC's comment is A<text>, not @.
+      if (doc?.kind === "dnf" || doc?.kind === "nota_credito" || doc?.payments.length) return nak();
       if (!doc) openFactura();
       state.doc.lines.push(`|${cmd.slice(1)}|`);
       return ack();
     }
-    if (cmd[0] in RATE_INDEX && /^[ !"#$]\d{18}/.test(cmd)) {
+    const factItem = cmd[0] in RATE_INDEX && /^[ !"#$]\d{18}/.test(cmd);
+    const ncItem = /^d[0-4]\d{18}/.test(cmd);
+    if (factItem || ncItem) {
       if (doc?.kind === "dnf" || doc?.payments.length || doc?.subtotal) return nak();
+      if (factItem && doc?.kind === "nota_credito") return nak();
+      const ncAsFactura = ncItem && opts.ncOpensAsFactura && doc?.kind === "factura";
+      if (ncItem && !ncAsFactura && (doc?.kind !== "nota_credito" || !creditHeaderComplete(doc))) return nak();
+      const head = ncItem ? 2 : 1;
       const w = widthsForFlag21(state.flags[21]);
       const pw = w.priceInt + w.priceDec;
       const qw = w.qtyInt + w.qtyDec;
-      const price = BigInt(cmd.slice(1, 1 + pw));
-      const qty = BigInt(cmd.slice(1 + pw, 1 + pw + qw));
-      const desc = cmd.slice(1 + pw + qw);
+      const price = BigInt(cmd.slice(head, head + pw));
+      const qty = BigInt(cmd.slice(head + pw, head + pw + qw));
+      const desc = cmd.slice(head + pw + qw);
       if (qty <= 0n || !desc) return nak();
-      const idx = RATE_INDEX[cmd[0]];
+      const idx = ncItem ? Number(cmd[1]) : RATE_INDEX[cmd[0]];
       if (idx >= 1 && idx <= 3 && state.rates[idx - 1].bp === 0) return nak(0x54);
       // amount (cents) = price × qty, both fixed point, rounded half up
       const scale = 10n ** BigInt(w.priceDec) * 1000n;
@@ -276,12 +327,12 @@ export function createHkaSimulator(opts = {}) {
       return ack();
     }
     if (cmd === "3") {
-      if (!doc || doc.kind !== "factura" || doc.items === 0) return nak();
+      if (!isFiscal(doc) || doc.items === 0) return nak();
       doc.subtotal = true;
       return ack();
     }
     if (/^2\d{2}\d+$/.test(cmd)) {
-      if (!doc || doc.kind !== "factura" || doc.items === 0) return nak();
+      if (!isFiscal(doc) || doc.items === 0) return nak();
       const code = Number(cmd.slice(1, 3));
       if (code >= 20 && state.flags[50] !== 1) return nak();
       const cents = payAmount(cmd);
@@ -293,12 +344,12 @@ export function createHkaSimulator(opts = {}) {
     }
     if (cmd === "199") {
       if (!doc) return state.flags[50] === 1 ? nak() : ack();
-      if (doc.kind !== "factura" || doc.paid < totals().total) return nak();
+      if (!isFiscal(doc) || doc.paid < totals().total) return nak();
       closeFactura();
       return ack();
     }
     if (/^1\d{2}$/.test(cmd)) {
-      if (!doc || doc.kind !== "factura" || doc.items === 0) return nak();
+      if (!isFiscal(doc) || doc.items === 0) return nak();
       const code = Number(cmd.slice(1, 3));
       if (code >= 20 && state.flags[50] !== 1) return nak();
       const due = totals().total - doc.paid;
@@ -308,14 +359,19 @@ export function createHkaSimulator(opts = {}) {
       return ack();
     }
     if (cmd === "7") {
-      if (!doc || doc.kind !== "factura" || doc.payments.length > 0) return nak();
-      state.counters.factura++;
-      paper.push({ kind: "anulada", number: state.counters.factura, lines: doc.lines.slice() });
+      if (!isFiscal(doc) || doc.payments.length > 0) return nak();
+      if (doc.kind === "nota_credito") {
+        state.counters.nc++;
+        paper.push({ kind: "nc_anulada", number: state.counters.nc, lines: doc.lines.slice() });
+      } else {
+        state.counters.factura++;
+        paper.push({ kind: "anulada", number: state.counters.factura, lines: doc.lines.slice() });
+      }
       state.doc = null;
       return ack();
     }
     if (/^8[01]/.test(cmd)) {
-      if (doc?.kind === "factura") return nak();
+      if (isFiscal(doc)) return nak();
       if (!doc) state.doc = { kind: "dnf", items: 0, amounts: [0, 0, 0, 0, 0], paid: 0, payments: [], subtotal: false, lines: [], customer: [] };
       state.doc.lines.push(cmd.slice(3));
       if (cmd[1] === "1") {

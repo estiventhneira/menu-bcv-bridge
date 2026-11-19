@@ -72,7 +72,7 @@ import { createOpsStore } from "./lan-ops.mjs";
 import { createOpsUploader } from "./lan-upload.mjs";
 import { createTicketArchive } from "./lan-archive.mjs";
 import { lanTokenHasScope } from "./lan-token.mjs";
-import { peekFiscal, signFiscal, validatePlan, verifyFiscal } from "./fiscal-plan.mjs";
+import { peekFiscal, signFiscal, validateCreditPlan, validatePlan, verifyFiscal } from "./fiscal-plan.mjs";
 import { createFiscalJournal } from "./fiscal/fiscal-journal.mjs";
 import { createFiscalHost, parseFiscalMachines } from "./fiscal/fiscal-host.mjs";
 import { listSerialPorts, openSerialLink } from "./fiscal/serial-link.mjs";
@@ -866,7 +866,9 @@ function lanHello(claims) {
   if (relayBoard) features.push("relay", "seq");
   if (relayBoard && opsStore) features.push("ops");
   if (archive) features.push("archive");
-  if (fiscalHost) features.push("fiscal");
+  // 0.9.6: "fiscal_nc" = this bridge prints notas de crédito;
+  // "fiscal_exempt" = it prints exento lines (the propina, v 3 plans).
+  if (fiscalHost) features.push("fiscal", "fiscal_nc", "fiscal_exempt");
   return {
     device_id: DEVICE_ID,
     now: new Date().toISOString(),
@@ -1103,6 +1105,17 @@ async function fiscalInvoice(claims, req) {
   return fiscalHost.invoice(claims, p.plan);
 }
 
+/** 0.9.6: a nota de crédito — only a v 2 credit plan, never a factura plan. */
+async function fiscalCreditNote(claims, req) {
+  if (!fiscalHost) return NOT_FOUND;
+  const v = verifyFiscalToken(claims, "plan", req.plan);
+  if (!v.ok) return { status: 400, body: { ok: false, error: v.error } };
+  const p = validateCreditPlan(v.payload);
+  if (!p.ok) return { status: 400, body: { ok: false, error: `plan_${p.error}` } };
+  log(`fiscal: nota de crédito de la factura ${p.plan.credit.number} en ${p.plan.registro} (pedida por ${claims.u})`);
+  return fiscalHost.creditNote(claims, p.plan);
+}
+
 function fiscalJob(claims, req) {
   if (!fiscalHost) return NOT_FOUND;
   const body = fiscalHost.job(claims.r, req.job);
@@ -1174,7 +1187,18 @@ async function startLanServer() {
     ...(relayBoard ? { relayPush, relayPull, relayAck, relaySeq } : {}),
     ...(archive ? { ticketsList, ticketReprint } : {}),
     ...(fiscalHost
-      ? { fiscalStatus, fiscalInvoice, fiscalJob, fiscalAck, fiscalPorts, fiscalConnect, fiscalDisconnect, fiscalTest, fiscalReportX }
+      ? {
+          fiscalStatus,
+          fiscalInvoice,
+          fiscalCreditNote,
+          fiscalJob,
+          fiscalAck,
+          fiscalPorts,
+          fiscalConnect,
+          fiscalDisconnect,
+          fiscalTest,
+          fiscalReportX,
+        }
       : {}),
     log,
   });
